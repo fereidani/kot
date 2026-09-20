@@ -1,0 +1,314 @@
+//! Process-level syscalls: namespace entry, execution, scheduling, and the
+//! smaller knobs the OCI configuration exposes.
+
+use core::ffi::CStr;
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
+
+use crate::sys::{
+    error::{Error, Result},
+    path,
+    raw::{
+        arg_fd, arg_i32, arg_ref, arg_u64, nr, ret_unit, ret_usize, syscall1,
+        syscall2, syscall3, syscall5,
+    },
+};
+
+/// Operate on the descriptor itself, with an empty path.
+pub const AT_EMPTY_PATH: usize = 0x1000;
+
+/// Joins the namespace that `fd` refers to.
+///
+/// When `fd` is a pidfd, `nstype` may be a mask of several `CLONE_NEW*` flags
+/// and the kernel joins all of them in one call. When it is a namespace file
+/// from `/proc/<pid>/ns/`, `nstype` is either zero or the single matching
+/// flag.
+pub fn setns(fd: BorrowedFd<'_>, nstype: u64) -> Result<()> {
+    // SAFETY: both arguments are scalars and `fd` is valid for the call.
+    let r = unsafe { syscall2(nr::SETNS, arg_fd(fd), arg_u64(nstype)) };
+    ret_unit(r, "setns")
+}
+
+/// Arranges for a command's child to join `namespaces` before it executes.
+///
+/// The descriptors are opened by the caller, before the fork, because between
+/// the fork and the execution a child may only call what is
+/// async-signal-safe: it cannot open anything, and it cannot allocate.
+///
+/// The order is the caller's, and it matters: a user namespace decides what
+/// the joins after it may do, and a mount namespace changes what every path
+/// means, so those belong at the ends.
+pub fn join_before_exec(
+    command: &mut std::process::Command,
+    namespaces: Vec<OwnedFd>,
+) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: the closure runs in the forked child, which has one thread,
+    // between the fork and `execve`. It calls `setns` and nothing else: no
+    // allocation, no lock, and no descriptor it was not already handed.
+    unsafe {
+        command.pre_exec(move || {
+            for fd in &namespaces {
+                setns(fd.as_fd(), 0).map_err(|error| {
+                    std::io::Error::from_raw_os_error(error.errno())
+                })?;
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Executes the program that `fd` refers to.
+///
+/// Taking the program as a descriptor rather than a path closes the window
+/// between checking a path and executing it, which matters because the
+/// container controls the filesystem the path is resolved in.
+///
+/// # Safety
+///
+/// `argv` and `envp` must be NUL-terminated arrays of NUL-terminated strings
+/// that stay valid for the duration of the call.
+#[must_use]
+pub unsafe fn fexecve(
+    fd: BorrowedFd<'_>,
+    argv: *const *const u8,
+    envp: *const *const u8,
+) -> Error {
+    // SAFETY: the caller guarantees the shape and lifetime of `argv` and
+    // `envp`; `AT_EMPTY_PATH` makes the kernel ignore the empty path and use
+    // the descriptor instead. Like `execveat`, this only returns on failure.
+    unsafe { execveat(fd, path::EMPTY, argv, envp, AT_EMPTY_PATH) }
+}
+
+/// Executes `path` relative to `dirfd`, returning only on failure.
+///
+/// # Safety
+///
+/// As [`fexecve`].
+#[must_use]
+pub unsafe fn execveat(
+    dirfd: BorrowedFd<'_>,
+    path: &CStr,
+    argv: *const *const u8,
+    envp: *const *const u8,
+    flags: usize,
+) -> Error {
+    // SAFETY: the caller guarantees the shape and lifetime of `argv` and
+    // `envp`, and `CStr` guarantees `path` is NUL terminated.
+    let r = unsafe {
+        syscall5(
+            nr::EXECVEAT,
+            arg_fd(dirfd),
+            path.as_ptr() as usize,
+            argv as usize,
+            envp as usize,
+            flags,
+        )
+    };
+    Error::from_ret(r, "execveat")
+}
+
+/// Duplicates `old` onto `new`, closing whatever was there.
+///
+/// Taking raw numbers is deliberate: this renumbers a descriptor table onto
+/// fixed slots, where the target is a number rather than something the caller
+/// owns.
+///
+/// # Safety
+///
+/// `old` must name a descriptor this process owns. Anything currently at `new`
+/// is closed, so the caller must not be holding it through a safe wrapper.
+pub unsafe fn dup3(old: i32, new: i32, flags: u32) -> Result<()> {
+    // SAFETY: all three arguments are scalars; the caller upholds the
+    // descriptor ownership contract described above.
+    let r = unsafe {
+        syscall3(nr::DUP3, arg_i32(old), arg_i32(new), flags as usize)
+    };
+    ret_unit(r, "dup3")
+}
+
+/// Closes every descriptor from `first` to `last`, inclusive.
+///
+/// Used once, just before the payload runs, to make sure the container starts
+/// with exactly the descriptors it was promised and nothing the runtime
+/// happened to be holding.
+pub fn close_range(first: u32, last: u32, flags: u32) -> Result<()> {
+    // SAFETY: all three arguments are scalars. Closing a range the caller has
+    // finished with is the operation's whole purpose.
+    let r = unsafe {
+        syscall3(
+            nr::CLOSE_RANGE,
+            first as usize,
+            last as usize,
+            flags as usize,
+        )
+    };
+    ret_unit(r, "close_range")
+}
+
+/// Execution domain: native Linux.
+pub const PER_LINUX: u64 = 0x0000_0000;
+/// Execution domain: report a 32 bit machine from `uname`.
+pub const PER_LINUX32: u64 = 0x0000_0008;
+/// Execution domain flag: lay the address space out the same way every run.
+pub const ADDR_NO_RANDOMIZE: u64 = 0x0004_0000;
+
+/// Sets the execution domain for the calling process.
+pub fn personality(persona: u64) -> Result<()> {
+    // SAFETY: the single argument is a scalar.
+    let r = unsafe { syscall1(nr::PERSONALITY, arg_u64(persona)) };
+    ret_unit(r, "personality")
+}
+
+/// I/O priority class: real time.
+pub const IOPRIO_CLASS_RT: u32 = 1;
+/// I/O priority class: best effort.
+pub const IOPRIO_CLASS_BE: u32 = 2;
+/// I/O priority class: idle.
+pub const IOPRIO_CLASS_IDLE: u32 = 3;
+
+const IOPRIO_WHO_PROCESS: usize = 1;
+const IOPRIO_CLASS_SHIFT: u32 = 13;
+
+/// Sets the calling process's I/O priority.
+pub fn set_ioprio(class: u32, priority: u32) -> Result<()> {
+    let value = (class << IOPRIO_CLASS_SHIFT) | (priority & 0x1fff);
+    // SAFETY: all three arguments are scalars.
+    let r = unsafe {
+        syscall3(nr::IOPRIO_SET, IOPRIO_WHO_PROCESS, 0, value as usize)
+    };
+    ret_unit(r, "ioprio_set")
+}
+
+/// Scheduling policy: the default time-sharing policy.
+pub const SCHED_OTHER: u32 = 0;
+/// Scheduling policy: first in, first out real time.
+pub const SCHED_FIFO: u32 = 1;
+/// Scheduling policy: round robin real time.
+pub const SCHED_RR: u32 = 2;
+/// Scheduling policy: batch.
+pub const SCHED_BATCH: u32 = 3;
+/// Scheduling policy: idle.
+pub const SCHED_IDLE: u32 = 5;
+/// Scheduling policy: earliest deadline first.
+pub const SCHED_DEADLINE: u32 = 6;
+
+/// Scheduling flag: revert to the default policy in children.
+pub const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
+/// Scheduling flag: reclaim unused deadline bandwidth.
+pub const SCHED_FLAG_RECLAIM: u64 = 0x02;
+/// Scheduling flag: send `SIGXCPU` when a deadline task overruns.
+pub const SCHED_FLAG_DL_OVERRUN: u64 = 0x04;
+/// Scheduling flag: keep the current policy.
+pub const SCHED_FLAG_KEEP_POLICY: u64 = 0x08;
+
+/// The kernel's `struct sched_attr`.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct SchedAttr {
+    size: u32,
+    /// One of the `SCHED_*` policies.
+    pub policy: u32,
+    /// A mask of `SCHED_FLAG_*`.
+    pub flags: u64,
+    /// Nice value, for the time-sharing policies.
+    pub nice: i32,
+    /// Static priority, for the real-time policies.
+    pub priority: u32,
+    /// Deadline policy: runtime budget in nanoseconds.
+    pub runtime: u64,
+    /// Deadline policy: relative deadline in nanoseconds.
+    pub deadline: u64,
+    /// Deadline policy: period in nanoseconds.
+    pub period: u64,
+}
+
+impl SchedAttr {
+    /// Builds an attribute block with the size field filled in.
+    #[must_use]
+    pub fn new(policy: u32) -> Self {
+        #[allow(clippy::cast_possible_truncation)]
+        Self {
+            size: core::mem::size_of::<Self>() as u32,
+            policy,
+            ..Self::default()
+        }
+    }
+}
+
+/// Applies a scheduling policy to the calling process.
+pub fn set_sched_attr(attr: &SchedAttr) -> Result<()> {
+    // SAFETY: `attr` is a correctly shaped `struct sched_attr` whose `size`
+    // field matches its own length, and it outlives the call.
+    let r = unsafe { syscall3(nr::SCHED_SETATTR, 0, arg_ref(attr), 0) };
+    ret_unit(r, "sched_setattr")
+}
+
+/// `KEYCTL_JOIN_SESSION_KEYRING`
+const KEYCTL_JOIN_SESSION_KEYRING: usize = 1;
+
+/// Creates a fresh session keyring named `name`.
+///
+/// Containers get their own keyring so that keys added inside one are not
+/// visible to the host or to other containers.
+pub fn join_session_keyring(name: &CStr) -> Result<usize> {
+    // SAFETY: `name` is NUL terminated and outlives the call.
+    let r = unsafe {
+        syscall2(
+            nr::KEYCTL,
+            KEYCTL_JOIN_SESSION_KEYRING,
+            name.as_ptr() as usize,
+        )
+    };
+    ret_usize(r, "keyctl(JOIN_SESSION_KEYRING)")
+}
+
+/// Memory policy: system default.
+pub const MPOL_DEFAULT: u32 = 0;
+/// Memory policy: prefer one node.
+pub const MPOL_PREFERRED: u32 = 1;
+/// Memory policy: allocate only from the given nodes.
+pub const MPOL_BIND: u32 = 2;
+/// Memory policy: interleave across the given nodes.
+pub const MPOL_INTERLEAVE: u32 = 3;
+/// Memory policy: allocate from the local node.
+pub const MPOL_LOCAL: u32 = 4;
+/// Memory policy: prefer any of the given nodes.
+pub const MPOL_PREFERRED_MANY: u32 = 5;
+/// Memory policy: interleave with per-node weights.
+pub const MPOL_WEIGHTED_INTERLEAVE: u32 = 6;
+
+/// Memory policy flag: node numbers are relative to the allowed set.
+pub const MPOL_F_RELATIVE_NODES: u32 = 1 << 14;
+/// Memory policy flag: node numbers are absolute.
+pub const MPOL_F_STATIC_NODES: u32 = 1 << 15;
+/// Memory policy flag: enable NUMA balancing for the mapping.
+pub const MPOL_F_NUMA_BALANCING: u32 = 1 << 13;
+
+/// Sets the calling process's NUMA memory policy.
+///
+/// `nodes` is a bitmask of node numbers, and `max_node` is one past the
+/// highest node the mask covers.
+///
+/// The kernel takes one more than that: `get_nodes` decrements what it is
+/// given before counting words, so the count on the wire is the number of bits
+/// plus one. libnuma sends the same, and sending `max_node` itself would leave
+/// the highest node out of the mask.
+pub fn set_mempolicy(mode: u32, nodes: &[u64], max_node: u64) -> Result<()> {
+    let ptr = if nodes.is_empty() {
+        0
+    } else {
+        nodes.as_ptr() as usize
+    };
+    // SAFETY: `nodes` outlives the call, and `max_node` bounds how much of it
+    // the kernel reads.
+    let r = unsafe {
+        syscall3(
+            nr::SET_MEMPOLICY,
+            mode as usize,
+            ptr,
+            arg_u64(max_node.saturating_add(1)),
+        )
+    };
+    ret_unit(r, "set_mempolicy")
+}

@@ -1,0 +1,13 @@
+# Conditional rules from the same profile, one per line:
+# name index value valueTwo op action
+personality 0 0 0 SCMP_CMP_EQ SCMP_ACT_ALLOW
+personality 0 8 0 SCMP_CMP_EQ SCMP_ACT_ALLOW
+personality 0 131072 0 SCMP_CMP_EQ SCMP_ACT_ALLOW
+personality 0 131080 0 SCMP_CMP_EQ SCMP_ACT_ALLOW
+personality 0 4294967295 0 SCMP_CMP_EQ SCMP_ACT_ALLOW
+socket 0 40 0 SCMP_CMP_EQ SCMP_ACT_ERRNO
+socket 0 16 0 SCMP_CMP_EQ SCMP_ACT_ERRNO
+socket 2 9 0 SCMP_CMP_EQ SCMP_ACT_ERRNO
+socket 0 16 0 SCMP_CMP_EQ SCMP_ACT_ALLOW
+socket 2 9 0 SCMP_CMP_NE SCMP_ACT_ALLOW
+socket 0 16 0 SCMP_CMP_NE SCMP_ACT_ALLOW

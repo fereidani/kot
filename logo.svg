@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Kot logo mark">
+  <path d="M28 142 L70 142 L46 98 L4 98 Z" fill="#343C4B"/>
+  <path d="M228 142 L186 142 L210 98 L252 98 Z" fill="#343C4B"/>
+  <path d="M78 86 Q70 40 74 32 Q78 26 86 32 L124 58 Q128 56 132 58 L170 32 Q178 26 182 32 Q186 40 178 86 A58 58 0 1 1 78 86 Z" fill="#FF8C42"/>
+  <path d="M88 80 L84 48 L112 68 Z" fill="#1E2430" opacity="0.2"/>
+  <path d="M168 80 L172 48 L144 68 Z" fill="#1E2430" opacity="0.2"/>
+  <ellipse cx="108" cy="106" rx="7.5" ry="9.5" fill="#1E2430"/>
+  <ellipse cx="148" cy="106" rx="7.5" ry="9.5" fill="#1E2430"/>
+  <path d="M120 124 L136 124 Q138 126 136 129 L130 136 Q128 137 126 136 L120 129 Q118 126 120 124 Z" fill="#1E2430"/>
+  <rect x="28" y="142" width="200" height="94" rx="14" fill="#1E2430"/>
+  <rect x="90" y="133" width="30" height="26" rx="13" fill="#FF8C42"/>
+  <rect x="136" y="133" width="30" height="26" rx="13" fill="#FF8C42"/>
+  <path d="M100 150 v9 M110 150 v9 M146 150 v9 M156 150 v9" stroke="#1E2430" stroke-width="3.5" stroke-linecap="round" fill="none"/>
+</svg>
