@@ -34,6 +34,15 @@ use crate::{
 const PRIVATE_SOCKET: &str = "/run/systemd/private";
 /// The system bus, used when the private socket is not reachable.
 const SYSTEM_BUS_SOCKET: &str = "/run/dbus/system_bus_socket";
+/// The longest answer to the greeting that is worth buffering. The reply is
+/// `OK` and a 32 character identifier, so anything longer is not one.
+const MAX_GREETING: usize = 256;
+/// How many lines the peer may send before the one that accepts the greeting.
+const MAX_GREETING_LINES: usize = 4;
+/// A user's own systemd, below the directory their session provides.
+const USER_PRIVATE_SOCKET: &str = "systemd/private";
+/// That user's bus, below the same directory.
+const USER_BUS_SOCKET: &str = "bus";
 
 /// A connection to systemd.
 pub struct Connection {
@@ -47,6 +56,12 @@ pub struct Connection {
     /// True when talking to the broker, which needs a destination on every
     /// call and a bus name of its own.
     brokered: bool,
+    /// The user whose systemd this is, when it is a user's rather than the
+    /// system's own.
+    owner: Option<u32>,
+    /// True once the peer's answer to the greeting has been read and
+    /// accepted. Until then it is still in front of the first message.
+    greeted: bool,
 }
 
 impl Connection {
@@ -56,19 +71,38 @@ impl Connection {
     /// reaches a user manager for rootless containers.
     pub fn open(bus_address: Option<&str>) -> Result<Self> {
         if let Some(path) = bus_address {
-            return Self::connect(path, true);
+            return Self::connect(path, true, None);
         }
-        match Self::connect(PRIVATE_SOCKET, false) {
-            Ok(connection) => Ok(connection),
-            Err(private) => {
-                Self::connect(SYSTEM_BUS_SOCKET, true).map_err(|bus| {
-                    if private.is_not_found() { bus } else { private }
-                })
+        // The system's own manager first, through a socket only privilege
+        // opens, so a privileged runtime lands there and nowhere else.
+        if let Ok(system) = Self::connect(PRIVATE_SOCKET, false, None) {
+            return Ok(system);
+        }
+        // Then the caller's own, which is where a rootless container's scope
+        // has to go. It is tried before the system bus because a rootless
+        // caller can usually connect to that and only then be refused, which
+        // would turn a working arrangement into a puzzling one.
+        if let Some((directory, owner)) = session() {
+            for (name, brokered) in
+                [(USER_PRIVATE_SOCKET, false), (USER_BUS_SOCKET, true)]
+            {
+                let path = format!("{directory}/{name}");
+                if let Ok(user) = Self::connect(&path, brokered, Some(owner)) {
+                    return Ok(user);
+                }
             }
         }
+        Self::connect(SYSTEM_BUS_SOCKET, true, None)
+            .map_err(|_| Error::msg("dbus: no systemd this runtime may use"))
     }
 
-    fn connect(path: &str, brokered: bool) -> Result<Self> {
+    /// The user whose systemd answered, or `None` for the system's own.
+    #[must_use]
+    pub const fn owner(&self) -> Option<u32> {
+        self.owner
+    }
+
+    fn connect(path: &str, brokered: bool, owner: Option<u32>) -> Result<Self> {
         let socket = UnixStream::connect(Path::new(path))
             .map_err(|e| from_io(&e, "dbus: connect"))?;
         let mut connection = Self {
@@ -77,8 +111,10 @@ impl Connection {
             inbox: Vec::with_capacity(4096),
             outbox: Vec::with_capacity(4096),
             brokered,
+            owner,
+            greeted: false,
         };
-        connection.authenticate()?;
+        connection.greet()?;
         if brokered {
             connection.hello()?;
         }
@@ -89,13 +125,20 @@ impl Connection {
         Ok(connection)
     }
 
-    /// Performs the `EXTERNAL` authentication handshake.
+    /// Sends the `EXTERNAL` authentication handshake, without waiting.
     ///
     /// The peer derives the caller's identity from the socket credentials, so
-    /// the only thing sent is which user to expect. Both the private socket
-    /// and the broker accept this.
-    fn authenticate(&mut self) -> Result<()> {
-        let uid = rustix::process::getuid().as_raw();
+    /// the only thing sent is which user to expect, and it has to be the one
+    /// the peer will see. Both the private socket and the broker accept this.
+    ///
+    /// `BEGIN` goes out in the same write, which puts the peer in message
+    /// mode before it reads anything further, so the first call can follow
+    /// without waiting. Waiting here would put a round trip to a busy systemd
+    /// on the path that creates every container, and buy nothing: the answer
+    /// is one line, it arrives in front of the first reply, and
+    /// [`Connection::check_greeting`] reads it there.
+    fn greet(&mut self) -> Result<()> {
+        let uid = peer_identity();
         let mut greeting = Vec::with_capacity(64);
         greeting.push(0u8);
         greeting.extend_from_slice(b"AUTH EXTERNAL ");
@@ -109,27 +152,38 @@ impl Connection {
         greeting.extend_from_slice(b"\r\nBEGIN\r\n");
         self.socket
             .write_all(&greeting)
-            .map_err(|e| from_io(&e, "dbus: auth write"))?;
+            .map_err(|e| from_io(&e, "dbus: auth write"))
+    }
 
-        // The peer answers with one or two lines before `BEGIN` takes effect.
-        // Read until the terminator of the last one, bounded so a peer that
-        // never finishes cannot hang the runtime.
-        let mut reply = [0u8; 256];
-        let mut filled = 0usize;
-        for _ in 0..8 {
-            let n = self
-                .socket
-                .read(reply.get_mut(filled..).unwrap_or(&mut []))
-                .map_err(|e| from_io(&e, "dbus: auth read"))?;
-            if n == 0 {
-                return Err(Error::msg("dbus: peer closed during auth"));
+    /// Takes the answer to the greeting off the front of the inbox.
+    ///
+    /// Returns false while the line is still short, leaving the bytes for the
+    /// next read to finish. Until it returns true the inbox does not hold a
+    /// message, so every reader has to come through here first.
+    fn check_greeting(&mut self) -> Result<bool> {
+        if self.greeted {
+            return Ok(true);
+        }
+        // The greeting asks for nothing that draws a second line, but a peer
+        // that sends one anyway is stepped over rather than mistaken for a
+        // message. Bounded: every turn takes one line out of the inbox.
+        for _ in 0..MAX_GREETING_LINES {
+            let Some(end) = position(&self.inbox, b"\r\n") else {
+                if self.inbox.len() > MAX_GREETING {
+                    return Err(Error::msg("dbus: auth reply too long"));
+                }
+                return Ok(false);
+            };
+            let line = self.inbox.get(..end).unwrap_or(&[]);
+            let accepted = line.starts_with(b"OK ");
+            let refused =
+                line.starts_with(b"REJECTED") || line.starts_with(b"ERROR");
+            self.inbox.drain(..end + 2);
+            if accepted {
+                self.greeted = true;
+                return Ok(true);
             }
-            filled += n;
-            let seen = reply.get(..filled).unwrap_or(&[]);
-            if contains(seen, b"\r\n") && contains(seen, b"OK ") {
-                return Ok(());
-            }
-            if contains(seen, b"REJECTED") || contains(seen, b"ERROR") {
+            if refused {
                 return Err(Error::msg("dbus: authentication rejected"));
             }
         }
@@ -225,6 +279,9 @@ impl Connection {
         &mut self,
         visit: impl FnOnce(&Header<'_>, &[u8]) -> Result<T>,
     ) -> Result<Option<T>> {
+        if !self.check_greeting()? {
+            return Ok(None);
+        }
         let Some(total) = message::message_length(&self.inbox)? else {
             return Ok(None);
         };
@@ -336,11 +393,59 @@ fn hex_uid(uid: u32, out: &mut [u8; 20]) -> &[u8] {
 }
 
 /// True when `haystack` contains `needle`.
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
+fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Converts a standard I/O error into the runtime's error type.
 fn from_io(error: &std::io::Error, context: &'static str) -> Error {
     Error::new(error.raw_os_error().unwrap_or(0), context)
+}
+
+/// The directory a session provides and the user it belongs to.
+///
+/// The user is read from the directory's name rather than from `geteuid`. A
+/// rootless engine runs the runtime inside a user namespace that maps the
+/// caller to zero, so the identity the kernel reports is not the one whose
+/// manager is listening on the socket, while the name of the directory still
+/// is. A directory not named for a user leaves nothing to go on, and the
+/// caller moves on to the next candidate.
+fn session() -> Option<(String, u32)> {
+    let directory = std::env::var("XDG_RUNTIME_DIR").ok()?;
+    let owner = Path::new(&directory).file_name()?.to_str()?.parse().ok()?;
+    Some((directory, owner))
+}
+
+/// The user the other end of a socket is told this process is.
+///
+/// A rootless engine runs the runtime inside a user namespace, where the
+/// kernel answers `getuid` with the mapped identity while a peer outside that
+/// namespace is told the one it maps to. Saying the inside answer gets the
+/// handshake refused by every systemd on the host, which looks from here like
+/// there being none. `/proc/self/uid_map` is that translation, and outside a
+/// namespace it is the identity map, so one read serves both cases.
+fn peer_identity() -> u32 {
+    let inside = rustix::process::getuid().as_raw();
+    let Ok(map) = std::fs::read_to_string("/proc/self/uid_map") else {
+        return inside;
+    };
+    for line in map.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(first), Some(outside), Some(count)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (Ok(first), Ok(outside), Ok(count)) = (
+            first.parse::<u32>(),
+            outside.parse::<u32>(),
+            count.parse::<u32>(),
+        ) else {
+            continue;
+        };
+        if inside >= first && inside - first < count {
+            return outside + (inside - first);
+        }
+    }
+    inside
 }

@@ -151,28 +151,43 @@ pub struct Store {
 
 impl Store {
     /// Opens a state root, creating it when missing.
+    ///
+    /// A caller that names one gets that and nothing else. Without one, the
+    /// defaults are tried in order and the first that can be made wins.
     pub fn open(root: Option<&str>) -> Result<Self> {
-        let path = match root {
-            Some(path) => PathBuf::from(path),
-            None => default_root(),
-        };
-        // Made outright first: the root is there on every command but the
-        // first, and asking whether it is costs the same as making it.
-        match rustix::fs::mkdir(&path, Mode::from_raw_mode(0o777)) {
-            Ok(()) | Err(Errno::EXIST) => {}
-            Err(Errno::NOENT) => {
-                fs::create_dir_all(&path).with_context(|| {
-                    format!("creating the state directory {}", path.display())
-                })?;
-            }
-            Err(e) => {
-                return Err(anyhow::Error::new(e).context(format!(
-                    "creating the state directory {}",
-                    path.display()
-                )));
+        if let Some(named) = root {
+            let path = PathBuf::from(named);
+            make_root(&path).with_context(|| {
+                format!("creating the state directory {}", path.display())
+            })?;
+            return Ok(Self { root: path });
+        }
+
+        let mut refused: Option<(PathBuf, std::io::Error)> = None;
+        for path in default_roots() {
+            match make_root(&path) {
+                Ok(()) => return Ok(Self { root: path }),
+                // Somewhere else may still serve, so the first refusal is
+                // kept to report if nothing does.
+                Err(e) if is_refusal(&e) => {
+                    refused.get_or_insert((path, e));
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "creating the state directory {}",
+                        path.display()
+                    )));
+                }
             }
         }
-        Ok(Self { root: path })
+
+        let Some((path, error)) = refused else {
+            bail!("there is nowhere to keep container state");
+        };
+        Err(anyhow::Error::new(error).context(format!(
+            "creating the state directory {}; name one with --root",
+            path.display()
+        )))
     }
 
     /// The state root itself.
@@ -353,6 +368,20 @@ impl Store {
             0,
         )
         .context("creating the start fifo")?;
+        // `mknodat` takes the mode through the umask, which on the usual 022
+        // leaves 0600 and takes away exactly the bit that matters. Init
+        // reopens this through `/proc/self/fd` after it has become the
+        // container's user, and that reopen is checked against the mode here,
+        // so a container asked to run as anyone but root would be unable to
+        // say it had started. The state directory is the runtime's own, so
+        // nothing that cannot already reach the fifo gains by this.
+        rustix::fs::chmodat(
+            rustix::fs::CWD,
+            c_path.as_c_str(),
+            Mode::from_raw_mode(0o622),
+            rustix::fs::AtFlags::empty(),
+        )
+        .context("setting the start fifo's mode")?;
 
         // Opened without access so it can be handed to init as a path alone;
         // init reopens it for writing once it is inside the container.
@@ -383,14 +412,25 @@ impl Store {
     }
 }
 
-/// Where state goes when the caller does not say.
+/// Where state goes when the caller does not say, in the order to try.
 ///
-/// A rootless runtime cannot write under `/run`, so it uses the directory the
-/// session provides, where every caller expects to find it.
-fn default_root() -> PathBuf {
+/// A privileged runtime keeps its state under `/run`; a rootless one keeps it
+/// in the directory the session provides. Which of those applies cannot be
+/// settled by asking for the effective user id, because a rootless engine runs
+/// the runtime inside a user namespace that maps the caller to zero: the
+/// answer comes back as root while the authority over the host's `/run` is
+/// still the caller's own. So `/run` is attempted rather than assumed, and a
+/// refusal moves on to the session's directory.
+fn default_roots() -> Vec<PathBuf> {
+    let session = session_root();
     if rustix::process::geteuid().is_root() {
-        return PathBuf::from(DEFAULT_ROOT);
+        return vec![PathBuf::from(DEFAULT_ROOT), session];
     }
+    vec![session]
+}
+
+/// The state directory belonging to the session the caller is part of.
+fn session_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(dir).join("kot");
     }
@@ -398,6 +438,50 @@ fn default_root() -> PathBuf {
         "/run/user/{}/kot",
         rustix::process::geteuid().as_raw()
     ))
+}
+
+/// Makes a state root, treating one that is already there as made.
+///
+/// Made outright first: the root is there on every command but the first, and
+/// asking whether it is costs the same as making it.
+fn make_root(path: &Path) -> std::io::Result<()> {
+    match rustix::fs::mkdir(path, Mode::from_raw_mode(0o777)) {
+        Ok(()) => Ok(()),
+        // Already there, which is every command but the first. It still has
+        // to be somewhere this process may write: a root left behind by a
+        // privileged run is not one a rootless run can use, and finding that
+        // out here is what lets the next location be tried instead of the
+        // first container failing.
+        Err(Errno::EXIST) => writable(path),
+        Err(Errno::NOENT) => fs::create_dir_all(path),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Reports whether a directory that already exists is one to write in.
+fn writable(path: &Path) -> std::io::Result<()> {
+    use rustix::fs::{Access, AtFlags, accessat};
+
+    // Asked of the effective identity, which is the one the writes will be
+    // made under.
+    accessat(
+        rustix::fs::CWD,
+        path,
+        Access::WRITE_OK | Access::EXEC_OK,
+        AtFlags::EACCESS,
+    )
+    .map_err(Into::into)
+}
+
+/// True when a location turned the runtime away rather than failing at it.
+///
+/// These are the answers that mean the place is not the runtime's to write in.
+/// Anything else is a real failure and is reported where it happened, because
+/// trying somewhere else would only bury it.
+fn is_refusal(error: &std::io::Error) -> bool {
+    use crate::sys::error::{EACCES, EPERM, EROFS};
+
+    matches!(error.raw_os_error(), Some(EACCES | EPERM | EROFS))
 }
 
 /// Rejects an identifier that would escape the state directory.

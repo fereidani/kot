@@ -137,6 +137,9 @@ pub fn cgroup_for(record: &Record) -> Result<crate::cgroup::Manager> {
         _ => path,
     };
     let mut manager = crate::cgroup::Manager::new(kind, path, &record.id)?;
+    // Where a systemd scope landed depends on which systemd made it, so it is
+    // taken from the record rather than worked out again.
+    manager.relocate(&record.cgroup_path)?;
     let _ = manager.wait_ready();
     Ok(manager)
 }

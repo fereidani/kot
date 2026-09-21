@@ -54,3 +54,37 @@ fn a_created_cgroup_has_a_device_directory() {
 
     manager.destroy().expect("remove the cgroup");
 }
+
+/// A command naming a container that has gone must not wait for its cgroup.
+///
+/// Waiting for a scope to appear is right while one has been asked for and
+/// wrong afterwards. A manager rebuilt from a state record is answering for a
+/// container somebody else created, and once that container has gone the
+/// directory never comes back, so the wait ran to its deadline. Every
+/// `state`, `kill` and `delete` of a stopped container paid a full second for
+/// it, which is longer than starting the container took.
+#[test]
+fn a_manager_that_asked_for_nothing_does_not_wait() {
+    use std::time::{Duration, Instant};
+
+    let id = format!("gone-{}", std::process::id());
+    let Ok(mut manager) = Manager::new(Kind::Systemd, None, &id) else {
+        println!("skipping: no cgroup hierarchy to detect");
+        return;
+    };
+
+    // Nothing was ever requested through this manager, so nothing is on its
+    // way and there is nothing to wait for.
+    let start = Instant::now();
+    let outcome = manager.wait_ready();
+    let took = start.elapsed();
+
+    assert!(
+        outcome.is_ok(),
+        "answering about a missing cgroup is not an error: {outcome:?}"
+    );
+    assert!(
+        took < Duration::from_millis(200),
+        "waited {took:?} for a cgroup nobody asked for"
+    );
+}

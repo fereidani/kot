@@ -313,6 +313,17 @@ fn supervise(
 
     sync::send(socket.as_fd(), &Message::new(Kind::Proceed))?;
 
+    // Applying the process settings is the last thing the new process does
+    // that its configuration can make fail, so the answer is waited for even
+    // when the caller detaches. Returning before it arrives closes this end
+    // of the socket under a process still reporting on it, which it then
+    // dies of, and the caller is told the exec succeeded.
+    driver::await_init(
+        socket.as_fd(),
+        Kind::Configured,
+        "applying the process configuration",
+    )?;
+
     if let Some(path) = options.pid_file.as_deref() {
         std::fs::write(path, format!("{pid}\n"))
             .with_context(|| format!("writing the pid file {path}"))?;

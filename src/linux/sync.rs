@@ -89,6 +89,11 @@ pub struct Message {
 /// Bytes one message occupies on the wire.
 pub const WIRE_SIZE: usize = 4 + 4 + 4 + 1 + 3 + CONTEXT_MAX;
 
+/// How many messages the driver can have sent that init has not read. The
+/// protocol is one exchange at a time, so this is a bound on a bug rather
+/// than on ordinary traffic.
+const MAX_UNREAD: usize = 4;
+
 impl Message {
     /// A message with no payload.
     #[must_use]
@@ -304,6 +309,28 @@ fn decode_whole(raw: &[u8; WIRE_SIZE], received: usize) -> Result<Message> {
         return Err(Error::msg("sync: short message"));
     }
     Message::decode(raw)
+}
+
+/// Empties anything the peer has already sent.
+///
+/// The driver sends its half of a handshake without waiting for init to be
+/// ready for it, so a failure part way through can leave a message unread.
+/// Closing a socket that still holds one resets the connection, and the
+/// driver's next read fails with that instead of returning the reason init
+/// is about to send. Draining first keeps the reason.
+///
+/// Non-blocking and bounded, because this runs while reporting a failure:
+/// there is nothing to wait for and nothing worth failing over.
+pub fn drain(socket: BorrowedFd<'_>) {
+    use rustix::net::{RecvFlags, recv};
+
+    let mut raw = [0u8; WIRE_SIZE];
+    for _ in 0..MAX_UNREAD {
+        match recv(socket, &mut raw[..], RecvFlags::DONTWAIT) {
+            Ok((0, _)) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
 }
 
 /// Receives a message and turns a failure into an error.

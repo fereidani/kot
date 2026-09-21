@@ -118,25 +118,24 @@ struct CapData {
     inheritable: u32,
 }
 
-/// Applies `sets` to the calling thread.
+/// Narrows the bounding set to `bounding`, and empties the ambient set.
 ///
-/// The order matters and is not negotiable:
+/// Runs before the user changes, and that is the whole point of its being
+/// separate. Giving up a bounding capability is checked against the effective
+/// set, and a change of user empties the effective set even when the caller
+/// has asked the kernel to keep the permitted one. Afterwards there is
+/// nothing left to give it up with, so a container asked to run as somebody
+/// else would keep every bounding capability its configuration meant to take
+/// away.
 ///
-/// 1. The ambient set is cleared, because raising a capability requires it to
-///    be in both the permitted and inheritable sets, which may not yet be true.
-/// 2. The bounding set is narrowed, which is irreversible and requires
-///    `CAP_SETPCAP`, so it happens while that is still held.
-/// 3. The effective, permitted and inheritable sets are installed together.
-/// 4. The ambient set is raised, which requires step 3 to have happened.
-///
-/// Getting this order wrong produces a container that silently holds more
-/// privilege than its configuration asked for, which is why it lives here
-/// rather than being open coded by callers.
-pub fn apply(sets: &CapSets) -> Result<()> {
+/// The ambient set goes first because raising a capability into it later
+/// needs that capability in both the permitted and the inheritable set, which
+/// is not yet true.
+pub fn narrow(bounding: u64) -> Result<()> {
     prctl::clear_ambient_caps()?;
 
     for cap in 0..=LAST_CAP {
-        if CapSets::has(sets.bounding, cap) {
+        if CapSets::has(bounding, cap) {
             continue;
         }
         // A capability the kernel does not implement cannot be in the
@@ -147,7 +146,19 @@ pub fn apply(sets: &CapSets) -> Result<()> {
             Err(e) => return Err(e),
         }
     }
+    Ok(())
+}
 
+/// Installs the sets the payload runs with, after [`narrow`].
+///
+/// The effective, permitted and inheritable sets go in together, and only
+/// then can the ambient set be raised, since a capability reaches the ambient
+/// set through the permitted and inheritable ones.
+///
+/// Getting this order wrong produces a container that silently holds more
+/// privilege than its configuration asked for, which is why it lives here
+/// rather than being open coded by callers.
+pub fn apply(sets: &CapSets) -> Result<()> {
     set_caps(sets.effective, sets.permitted, sets.inheritable)?;
 
     for cap in 0..=LAST_CAP {

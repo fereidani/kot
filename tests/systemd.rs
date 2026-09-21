@@ -558,3 +558,67 @@ fn a_scope_name_can_be_reused_immediately() {
     }
     cleanup(&name);
 }
+
+/// A scope has to be looked for where the systemd that made it puts it.
+///
+/// The runtime used to reach only the system's own manager and to build the
+/// path below `system.slice`. A rootless container's scope is made by the
+/// caller's own manager, which hangs its units below its own service and puts
+/// them in a different slice, so a container that started would then have been
+/// waited for in a directory that never appears.
+#[test]
+fn a_scope_is_found_where_the_manager_that_made_it_puts_it() {
+    let Some(connection) = connect() else {
+        return;
+    };
+    let owner = connection.owner();
+    drop(connection);
+
+    let Some(mut victim) = Victim::spawn() else {
+        println!("skipping: no sleep binary");
+        return;
+    };
+    let id = format!("found{}", std::process::id());
+    let mut manager =
+        Manager::new(Kind::Systemd, None, &id).expect("building a manager");
+    manager
+        .begin_create(i32::try_from(victim.pid()).expect("pid"), None)
+        .expect("asking for the scope");
+    let computed = manager.path().to_string();
+
+    let ready = manager.wait_ready();
+    // The directory appearing and the process arriving in it are two steps,
+    // and only the second says where the scope really is.
+    let cgroup_of = |pid: u32| {
+        std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+            .unwrap_or_default()
+            .trim()
+            .rsplit("::")
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let moved = wait_for(|| cgroup_of(victim.pid()).contains(&id));
+    let actual = cgroup_of(victim.pid());
+
+    let _ = manager.destroy();
+    let _ = victim.0.kill();
+    let _ = victim.0.wait();
+
+    assert_eq!(
+        computed, actual,
+        "the runtime looked for the scope somewhere else than systemd made it \
+         (owner {owner:?})"
+    );
+    assert!(
+        ready.is_ok(),
+        "the cgroup should have been found: {ready:?}"
+    );
+    assert!(moved.is_some(), "the process never joined a scope");
+    let expected_user = owner.is_some();
+    assert_eq!(
+        computed.starts_with("/user.slice/"),
+        expected_user,
+        "a user manager's scope belongs below its own service: {computed}"
+    );
+}

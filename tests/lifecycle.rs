@@ -21,7 +21,7 @@ mod bundle;
 
 use std::{thread::sleep, time::Duration};
 
-use bundle::{Bundle, expect_ok, stderr, stdout};
+use bundle::{Bundle, RUNTIME, expect_ok, stderr, stdout};
 
 /// True when this process can create containers.
 ///
@@ -1509,5 +1509,94 @@ fn copy_symlink_refuses_a_destination_that_is_not_the_link() {
         stderr(&output).contains("destination is not a link"),
         "the refusal should say why: {}",
         stderr(&output).trim()
+    );
+}
+
+/// The state root has to be attempted rather than assumed.
+///
+/// A rootless engine runs the runtime inside a user namespace that maps the
+/// caller to zero, so asking for the effective user id answers root while the
+/// authority over the host's `/run` is still the caller's own. Taking that
+/// answer at face value left the runtime reporting that it could not make
+/// `/run/kot` and starting nothing. Here `/run` is made read-only in a mount
+/// namespace of the test's own, which is the same refusal arriving at the
+/// same decision.
+#[test]
+fn the_state_root_falls_back_when_run_refuses() {
+    if !privileged() {
+        return;
+    }
+    if std::process::Command::new("unshare")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        println!("skipping: unshare is not available");
+        return;
+    }
+
+    let session = std::env::temp_dir()
+        .join(format!("kot-session-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&session);
+    std::fs::create_dir_all(&session).expect("session directory");
+
+    // The namespace is private, so nothing here reaches the host's mounts.
+    let script = format!(
+        "mount -t tmpfs -o ro tmpfs /run && exec {RUNTIME} state absent"
+    );
+    let output = std::process::Command::new("unshare")
+        .args(["--mount", "--propagation", "private", "--", "sh", "-c"])
+        .arg(&script)
+        .env("XDG_RUNTIME_DIR", &session)
+        .output()
+        .expect("running the runtime with /run read only");
+
+    let complaint = String::from_utf8_lossy(&output.stderr).into_owned();
+    let landed = session.join("kot").is_dir();
+    let _ = std::fs::remove_dir_all(&session);
+
+    assert!(
+        !complaint.contains("state directory"),
+        "the runtime should have moved on from /run, but said: {}",
+        complaint.trim()
+    );
+    assert!(
+        complaint.contains("does not exist"),
+        "the store should have opened and the container be missing: {}",
+        complaint.trim()
+    );
+    assert!(
+        landed,
+        "the state root should have been made in the session"
+    );
+}
+
+/// A container asked to run as somebody other than root has to be able to
+/// say it has started.
+///
+/// Init reports readiness by reopening the start fifo through
+/// `/proc/self/fd`, and that reopen is checked against the fifo's own mode
+/// after init has become the container's user. The mode was asked for as
+/// 0622 and granted as 0600, because `mknod` takes it through the umask, so
+/// the container died between `create` and `start` with nobody left to say
+/// why: the driver had already reported success.
+#[test]
+fn a_container_running_as_another_user_can_start() {
+    if !privileged() {
+        return;
+    }
+    let bundle =
+        Bundle::with_config("otheruser", &["/usr/bin/id", "-u"], |config| {
+            *config = config.replace(
+                r#""user": { "uid": 0, "gid": 0 },"#,
+                r#""user": { "uid": 1000, "gid": 0, "additionalGids": [0] },"#,
+            );
+        });
+    let id = bundle.id();
+    expect_ok("create", &bundle.runtime(&["create", &id]));
+    expect_ok("start", &bundle.runtime(&["start", &id]));
+    assert!(
+        wait_for_status(&bundle, "stopped"),
+        "the container should have run and exited"
     );
 }

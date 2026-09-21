@@ -265,6 +265,17 @@ pub fn drop_privileges(plan: &View<'_>, process: &Process) -> Result<()> {
     Ok(())
 }
 
+/// Narrows the bounding set, before the user changes.
+///
+/// Separate from [`apply_capabilities`] because giving up a bounding
+/// capability needs one the change of user takes away.
+pub fn narrow_capabilities(process: &Process) -> Result<()> {
+    if !process.has(process_flag::HAS_CAPS) {
+        return Ok(());
+    }
+    crate::sys::caps::narrow(process.cap_bounding)
+}
+
 /// Installs the capability sets.
 pub fn apply_capabilities(process: &Process) -> Result<()> {
     if !process.has(process_flag::HAS_CAPS) {

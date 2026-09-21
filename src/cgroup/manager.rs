@@ -61,6 +61,12 @@ impl Kind {
     }
 }
 
+/// The slice the system's own manager puts a container in.
+const SYSTEM_SLICE: &str = "system.slice";
+
+/// The slice a user's manager puts one in, which is not the same.
+const USER_SLICE: &str = "app.slice";
+
 /// How long to wait for a systemd scope to appear or disappear.
 ///
 /// Measured, creation takes about 11 ms and collection about 1 ms. A second is
@@ -118,7 +124,7 @@ impl Manager {
             layout,
             path: Path::new(),
             unit: None,
-            slice: "system.slice".to_owned(),
+            slice: SYSTEM_SLICE.to_owned(),
             connection: None,
             pending: None,
             scope_carries_limits: false,
@@ -185,6 +191,43 @@ impl Manager {
             self.path.join(unit.as_bytes())?;
         }
         Ok(())
+    }
+
+    /// Puts the scope where a user's own systemd will make it.
+    ///
+    /// A user manager's units hang below its own service in the tree rather
+    /// than below the system's slices, and the slice it puts an application
+    /// in by default is not the one the system manager uses.
+    fn place_under(&mut self, uid: u32) -> Result<()> {
+        if self.slice == SYSTEM_SLICE {
+            USER_SLICE.clone_into(&mut self.slice);
+        }
+        self.path.clear();
+        self.path.push_str("/user.slice/user-")?;
+        self.path.push_u64(u64::from(uid))?;
+        self.path.push_str(".slice/user@")?;
+        self.path.push_u64(u64::from(uid))?;
+        self.path.push_str(".service")?;
+        for component in expand_slice(&self.slice) {
+            self.path.join(component.as_bytes())?;
+        }
+        if let Some(unit) = self.unit.as_deref() {
+            self.path.join(unit.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Points a rebuilt manager at the cgroup a previous run recorded.
+    ///
+    /// Where a scope landed is not derivable from the container's name alone:
+    /// it depends on which systemd made it. A later command takes the answer
+    /// from the state record instead of working it out again.
+    pub fn relocate(&mut self, path: &str) -> Result<()> {
+        if path.is_empty() {
+            return Ok(());
+        }
+        self.path.clear();
+        self.path.push_str(path)
     }
 
     /// The container's cgroup path, relative to the hierarchy root.
@@ -383,6 +426,14 @@ impl Manager {
         let Some(unit) = self.unit.clone() else {
             return Err(Error::msg("cgroup: systemd manager has no unit name"));
         };
+        // Which systemd answers decides where the scope will be, so the
+        // connection is opened before the request is described rather than
+        // when it is sent.
+        let owner =
+            connection(&mut self.connection, "cgroup: no connection")?.owner();
+        if let Some(uid) = owner {
+            self.place_under(uid)?;
+        }
         let pids = [pid.unsigned_abs()];
         let mut properties = Vec::with_capacity(8);
         properties.push(Property::Str("Description", "kot container"));
@@ -461,10 +512,13 @@ impl Manager {
             return self.open_legacy(false);
         }
         let full = self.full_path()?;
-        if self.kind == Kind::Cgroupfs {
-            // Nothing to wait for: the directory either exists already, which
-            // is the case whenever a manager is rebuilt from a state record,
-            // or it does not and the caller is about to create it.
+        // Nothing is on its way unless this manager is the one that asked for
+        // it. The cgroupfs path never asks, and a manager rebuilt from a
+        // state record is answering for a container somebody else created:
+        // either the directory is there, or the container has gone and no
+        // amount of waiting will bring it back. Waiting anyway spent the
+        // whole deadline on every command a stopped container was named in.
+        if self.kind == Kind::Cgroupfs || self.pending.is_none() {
             self.directory = layout::open_directory(&full).ok();
             return Ok(());
         }

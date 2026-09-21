@@ -42,6 +42,13 @@ pub fn run(args: &InitArgs) -> Failure {
     match attempt(args, socket) {
         Ok(failure) => failure,
         Err(error) => {
+            // Whatever the driver has already sent comes off the socket
+            // first. Init takes the driver's word for the cgroup only when it
+            // reaches the mount that needs it, so a failure before then would
+            // otherwise close this end with that word still queued, which
+            // resets the connection and leaves the driver reporting the reset
+            // rather than the reason.
+            sync::drain(socket);
             // The driver is the only thing that can report this usefully: init
             // may be inside a user namespace with no filesystem it can reach
             // and no terminal it can write to. Saying so again here would put
@@ -149,16 +156,6 @@ impl Init<'_> {
             sync::expect(self.socket, Kind::IdMapsWritten)?;
         }
 
-        // A cgroup namespace is rooted where its creator sits, so it can only
-        // be made once the driver has moved init into the container's cgroup.
-        // Waiting here costs the overlap between the driver's cgroup work and
-        // the filesystem work below, which is why only a container that asked
-        // for the namespace waits.
-        if self.container.cgroup_namespace {
-            sync::expect(self.socket, Kind::CgroupJoined)?;
-            namespace::unshare(crate::sys::clone::CLONE_NEWCGROUP)?;
-        }
-
         // A foreground container should not outlive the runtime that is
         // waiting on it, so the kernel is asked to kill it if that process
         // disappears. A container created to be started later is the opposite
@@ -174,7 +171,6 @@ impl Init<'_> {
         // to mount, nothing to pivot into, and nothing to name.
         if !self.container.join_only {
             self.build_filesystem()?;
-            rootfs::apply_sysctls(self.plan)?;
             rootfs::apply_names(self.plan, &self.container)?;
             if self.container.new_keyring {
                 namespace::new_session_keyring("container")?;
@@ -190,6 +186,21 @@ impl Init<'_> {
         self.finish()
     }
 
+    /// Takes the cgroup namespace, once the driver says the move is done.
+    ///
+    /// A cgroup namespace is rooted where its maker sits, so it cannot be made
+    /// before the driver has put this process in the container's cgroup. The
+    /// driver says so exactly once, and only when the configuration asked for
+    /// the namespace at all.
+    fn enter_cgroup_namespace(&self) -> Result<()> {
+        if !self.container.cgroup_namespace {
+            return Ok(());
+        }
+        sync::expect(self.socket, Kind::CgroupJoined)?;
+        namespace::unshare(crate::sys::clone::CLONE_NEWCGROUP)?;
+        Ok(())
+    }
+
     /// Builds the container's filesystem view, in the order that works.
     fn build_filesystem(&self) -> Result<()> {
         let (plan, container) = (self.plan, &self.container);
@@ -200,7 +211,20 @@ impl Init<'_> {
         let mut resolver = Resolver::new(root_path)?;
 
         let joined = self.args.namespaces;
+        let mut in_cgroup_namespace = false;
         plan.mounts(|op| {
+            // Only a cgroup mount depends on the namespace, and it is the
+            // last thing a stock bundle asks for. Waiting here rather than
+            // before any of this is what lets the driver settle the container
+            // cgroup, which takes the best part of ten milliseconds between
+            // systemd and the move, while the rest of the filesystem is
+            // built.
+            if !in_cgroup_namespace
+                && matches!(plan.text(op.fstype)?, "cgroup" | "cgroup2")
+            {
+                self.enter_cgroup_namespace()?;
+                in_cgroup_namespace = true;
+            }
             // A mount with an id mapping names the namespace carrying it by
             // position. The driver placed those above the namespaces to join,
             // in the order the mount records name them.
@@ -220,6 +244,9 @@ impl Init<'_> {
             };
             mount::establish(plan, &mut resolver, &op, idmap)
         })?;
+        if !in_cgroup_namespace {
+            self.enter_cgroup_namespace()?;
+        }
         rootfs::create_devices(plan, &mut resolver)?;
 
         // The hooks that run inside the container but still resolve their own
@@ -239,6 +266,15 @@ impl Init<'_> {
         // so the resolver starts again from the new one.
         drop(resolver);
         let mut inside = Resolver::new(c"/")?;
+
+        // Before the paths below are made read only, and after the root has
+        // changed so that `/proc` means the container's. A configuration
+        // naming a parameter almost always names `/proc/sys` among the paths
+        // to seal as well, so the other order leaves every setting it asked
+        // for refused by a filesystem the runtime made read only a moment
+        // earlier.
+        rootfs::apply_sysctls(plan)?;
+
         rootfs::apply_paths(plan, &mut inside)?;
         if container.rootfs_readonly {
             rootfs::seal_root()?;
@@ -266,6 +302,16 @@ impl Init<'_> {
         Ok(())
     }
 
+    /// Installs the seccomp filter and hands any listener to the driver.
+    fn install_filter(&self, filter: &mut Vec<SockFilter>) -> Result<()> {
+        let listener =
+            process::apply_seccomp(self.plan, &self.payload, filter)?;
+        if let Some(listener) = listener {
+            self.deliver_listener(&listener)?;
+        }
+        Ok(())
+    }
+
     /// Applies the process settings and executes the payload.
     fn finish(&self) -> Result<Failure> {
         let (plan, payload) = (self.plan, &self.payload);
@@ -286,15 +332,25 @@ impl Init<'_> {
         // configuration asked to run.
         let program = process::resolve_program(&command)?;
 
+        // Installing a filter takes either `no_new_privs` or `CAP_SYS_ADMIN`.
+        // A configuration asking for the first gets its filter as late as it
+        // can, so that few of the runtime's own calls are made under it. One
+        // that does not has only the capability to offer, and that goes when
+        // privilege does, so the filter has to be in place before then.
+        let mut filter = Vec::<SockFilter>::new();
+        let guarded = payload.has(process_flag::NO_NEW_PRIVS);
+        if !guarded {
+            self.install_filter(&mut filter)?;
+        }
+
+        process::narrow_capabilities(payload)?;
         process::drop_privileges(plan, payload)?;
         process::apply_capabilities(payload)?;
         process::apply_labels(plan, payload)?;
         process::apply_no_new_privs(payload)?;
 
-        let mut filter = Vec::<SockFilter>::new();
-        let listener = process::apply_seccomp(plan, payload, &mut filter)?;
-        if let Some(listener) = listener {
-            self.deliver_listener(&listener)?;
+        if guarded {
+            self.install_filter(&mut filter)?;
         }
 
         // Everything the configuration asked for is applied. Saying so here
