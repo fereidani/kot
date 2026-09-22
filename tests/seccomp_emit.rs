@@ -22,9 +22,13 @@ mod fixture;
 
 use std::time::Instant;
 
-use kot::seccomp::{
-    Action, Arch, ArgCmp, Compiler, Op, Profile, Rule,
-    insn::{JMP_JA, RET_K},
+use kot::{
+    seccomp::{
+        Action, Arch, ArgCmp, Compiler, Op, Profile, Rule,
+        insn::{JMP_JA, RET_K},
+        tables,
+    },
+    sys::seccomp::{SockFilter, data},
 };
 
 /// The syscall tables must stay in step with the profiles real tooling emits.
@@ -258,8 +262,9 @@ fn actions_share_one_return() {
     let program = compiler.compile(&profile).expect("compile");
     let returns = program.iter().filter(|i| i.code == RET_K).count();
     assert_eq!(
-        returns, 3,
-        "one return for the default plus one per distinct action"
+        returns, 4,
+        "one return for the default, one per distinct action, and one for \
+         the syscalls too new for the tables"
     );
 }
 
@@ -443,4 +448,396 @@ fn branch_relaxation_shrinks_the_program() {
         .filter(|i| i.jt > 1 || i.jf > 1)
         .count();
     assert!(folded > 0, "no branch carries a folded displacement");
+}
+
+/// Classic BPF opcodes the emitter produces, encoded as the kernel defines
+/// them. The emitter's own copies are internal, and a test that borrowed them
+/// would agree with the emitter by construction rather than checking it.
+mod opcode {
+    pub const LD_W_ABS: u16 = 0x20;
+    pub const ALU_AND_K: u16 = 0x54;
+    pub const JMP_JA: u16 = 0x05;
+    pub const JMP_JEQ_K: u16 = 0x15;
+    pub const JMP_JGT_K: u16 = 0x25;
+    pub const JMP_JGE_K: u16 = 0x35;
+    pub const RET_K: u16 = 0x06;
+}
+
+/// The word a load at `offset` reads out of `seccomp_data`.
+fn word_at(offset: u32, arch: u32, nr: u32, args: &[u64; 6]) -> u32 {
+    if offset == data::NR {
+        return nr;
+    }
+    if offset == data::ARCH {
+        return arch;
+    }
+    for (index, value) in args.iter().enumerate() {
+        let index = index as u32;
+        if offset == data::arg_low(index) {
+            return *value as u32;
+        }
+        if offset == data::arg_high(index) {
+            return (*value >> 32) as u32;
+        }
+    }
+    panic!("unexpected load offset {offset}")
+}
+
+/// Runs a compiled filter the way the kernel would, returning its action.
+///
+/// Every jump the emitter produces goes forward, so the program cannot run
+/// for more steps than it has instructions.
+fn evaluate(
+    program: &[SockFilter],
+    arch: u32,
+    nr: u32,
+    args: &[u64; 6],
+) -> u32 {
+    let mut acc: u32 = 0;
+    let mut pc: usize = 0;
+    for _ in 0..program.len() {
+        let insn = program.get(pc).expect("the program ran off its end");
+        pc += 1;
+        match insn.code {
+            opcode::LD_W_ABS => acc = word_at(insn.k, arch, nr, args),
+            opcode::ALU_AND_K => acc &= insn.k,
+            opcode::RET_K => return insn.k,
+            opcode::JMP_JA => pc += insn.k as usize,
+            opcode::JMP_JEQ_K | opcode::JMP_JGT_K | opcode::JMP_JGE_K => {
+                let taken = match insn.code {
+                    opcode::JMP_JEQ_K => acc == insn.k,
+                    opcode::JMP_JGT_K => acc > insn.k,
+                    _ => acc >= insn.k,
+                };
+                pc += usize::from(if taken { insn.jt } else { insn.jf });
+            }
+            other => panic!("unexpected opcode {other:#x}"),
+        }
+    }
+    panic!("the program never returned");
+}
+
+/// A call arriving on an architecture the profile does not name is killed.
+///
+/// The syscall numbers a profile was written against name other calls on
+/// another ABI, so none of its rules describe what arrived. Answering with
+/// the profile's default action would mean a profile whose default is
+/// permissive stops restricting anything at all for a process that switches
+/// ABI, and every deny rule in it would be skipped.
+#[test]
+fn a_call_from_an_unnamed_architecture_is_killed() {
+    let allow = ["read", "write"];
+    let rules = [Rule {
+        names: &allow,
+        action: Action::Allow,
+        args: &[],
+    }];
+    for default_action in [Action::Allow, Action::Errno(1)] {
+        let profile = Profile {
+            default_action,
+            arches: &[Arch::X86_64],
+            rules: &rules,
+            fail_unknown_syscall: false,
+        };
+        let mut compiler = Compiler::new();
+        let program = compiler.compile(&profile).expect("compile");
+
+        for foreign in [Arch::X86, Arch::Aarch64, Arch::Arm] {
+            assert_eq!(
+                evaluate(program, foreign.audit_token(), 0, &[0; 6]),
+                Action::KillProcess.to_ret(),
+                "a call on {foreign:?} cannot be judged by this profile"
+            );
+        }
+    }
+}
+
+/// The architecture the profile does name still gets the profile's answers.
+///
+/// Without this the check above would hold for a filter that killed
+/// everything.
+#[test]
+fn a_named_architecture_still_gets_the_default_action() {
+    let allow = ["read", "write"];
+    let rules = [Rule {
+        names: &allow,
+        action: Action::Allow,
+        args: &[],
+    }];
+    for default_action in [Action::Allow, Action::Errno(1)] {
+        let profile = Profile {
+            default_action,
+            arches: &[Arch::X86_64],
+            rules: &rules,
+            fail_unknown_syscall: false,
+        };
+        let mut compiler = Compiler::new();
+        let program = compiler.compile(&profile).expect("compile");
+
+        // A syscall the tables know and no rule names reaches the default
+        // action. It has to be one the tables carry: a number above all of
+        // them is a call that did not exist when the profile was written,
+        // which the filter answers separately.
+        let unnamed = syscall_number(Arch::X86_64, "mount");
+        assert_eq!(
+            evaluate(program, Arch::X86_64.audit_token(), unnamed, &[0; 6]),
+            default_action.to_ret(),
+            "the named architecture keeps the profile's default"
+        );
+    }
+}
+
+/// The syscall number a name has on one architecture.
+fn syscall_number(arch: Arch, name: &str) -> u32 {
+    let slot = tables::NAMES
+        .iter()
+        .position(|known| *known == name)
+        .expect("the tables should know this name");
+    let number = arch.numbers()[slot];
+    u32::try_from(number).expect("implemented on this architecture")
+}
+
+/// Two conditions on the same argument are alternatives, not a conjunction.
+///
+/// A configuration listing two allowed values for one argument is asking for
+/// either of them. Requiring both would describe an argument equal to two
+/// different values at once, so the rule could never fire and the action it
+/// names would silently never apply.
+#[test]
+fn conditions_on_one_argument_are_alternatives() {
+    let names = ["personality"];
+    let args = [
+        ArgCmp {
+            index: 0,
+            value: 1,
+            value_two: 0,
+            op: Op::EqualTo,
+        },
+        ArgCmp {
+            index: 0,
+            value: 2,
+            value_two: 0,
+            op: Op::EqualTo,
+        },
+    ];
+    let rules = [Rule {
+        names: &names,
+        action: Action::Allow,
+        args: &args,
+    }];
+    let profile = Profile {
+        default_action: Action::Errno(1),
+        arches: &[Arch::X86_64],
+        rules: &rules,
+        fail_unknown_syscall: false,
+    };
+
+    let mut compiler = Compiler::new();
+    let program = compiler.compile(&profile).expect("compile");
+    let nr = syscall_number(Arch::X86_64, "personality");
+    let arch = Arch::X86_64.audit_token();
+
+    for value in [1, 2] {
+        let mut args = [0u64; 6];
+        args[0] = value;
+        assert_eq!(
+            evaluate(program, arch, nr, &args),
+            Action::Allow.to_ret(),
+            "either listed value should satisfy the rule"
+        );
+    }
+    let mut args = [0u64; 6];
+    args[0] = 3;
+    assert_eq!(
+        evaluate(program, arch, nr, &args),
+        Action::Errno(1).to_ret(),
+        "a value the rule does not list still takes the default"
+    );
+}
+
+/// Conditions on different arguments still all have to hold.
+///
+/// The alternative reading would turn a rule describing one call into one
+/// that fires on any of its parts, which would widen every profile that
+/// constrains two arguments at once.
+#[test]
+fn conditions_on_different_arguments_must_all_hold() {
+    let names = ["personality"];
+    let args = [
+        ArgCmp {
+            index: 0,
+            value: 1,
+            value_two: 0,
+            op: Op::EqualTo,
+        },
+        ArgCmp {
+            index: 1,
+            value: 7,
+            value_two: 0,
+            op: Op::EqualTo,
+        },
+    ];
+    let rules = [Rule {
+        names: &names,
+        action: Action::Allow,
+        args: &args,
+    }];
+    let profile = Profile {
+        default_action: Action::Errno(1),
+        arches: &[Arch::X86_64],
+        rules: &rules,
+        fail_unknown_syscall: false,
+    };
+
+    let mut compiler = Compiler::new();
+    let program = compiler.compile(&profile).expect("compile");
+    let nr = syscall_number(Arch::X86_64, "personality");
+    let arch = Arch::X86_64.audit_token();
+
+    let cases = [
+        ([1u64, 7], Action::Allow.to_ret()),
+        ([1, 8], Action::Errno(1).to_ret()),
+        ([2, 7], Action::Errno(1).to_ret()),
+    ];
+    for (values, expected) in cases {
+        let mut args = [0u64; 6];
+        args[0] = values[0];
+        args[1] = values[1];
+        assert_eq!(
+            evaluate(program, arch, nr, &args),
+            expected,
+            "arguments {values:?} should decide the rule together"
+        );
+    }
+}
+
+/// A syscall newer than the tables is reported as one the kernel lacks.
+///
+/// The profile's author decided nothing about a call that did not exist when
+/// they wrote it. Answering with the profile's denial tells a library the
+/// call is there and forbidden, and a library probing for a newer interface
+/// treats that as final rather than falling back to the one it has always
+/// used. `ENOSYS` is what an older kernel says, and it is the truth.
+#[test]
+fn a_syscall_newer_than_the_tables_reports_as_absent() {
+    const ENOSYS: u16 = 38;
+
+    let names = ["read", "write"];
+    let rules = [Rule {
+        names: &names,
+        action: Action::Allow,
+        args: &[],
+    }];
+    let profile = Profile {
+        default_action: Action::Errno(1),
+        arches: &[Arch::X86_64],
+        rules: &rules,
+        fail_unknown_syscall: false,
+    };
+    let mut compiler = Compiler::new();
+    let program = compiler.compile(&profile).expect("compile");
+    let arch = Arch::X86_64.audit_token();
+    let highest = Arch::X86_64.highest_number();
+
+    assert_eq!(
+        evaluate(program, arch, highest + 1, &[0; 6]),
+        Action::Errno(ENOSYS).to_ret(),
+        "a number above the tables is a call the kernel did not have"
+    );
+    assert_eq!(
+        evaluate(
+            program,
+            arch,
+            syscall_number(Arch::X86_64, "mount"),
+            &[0; 6]
+        ),
+        Action::Errno(1).to_ret(),
+        "a call the tables know still takes the profile's default"
+    );
+}
+
+/// A profile that allows by default says nothing new about a new syscall.
+///
+/// The call is allowed either way, so there is nothing to tell apart and no
+/// guard is emitted.
+#[test]
+fn an_allowing_profile_gets_no_absent_syscall_guard() {
+    let names = ["ptrace"];
+    let rules = [Rule {
+        names: &names,
+        action: Action::Errno(1),
+        args: &[],
+    }];
+    let profile = Profile {
+        default_action: Action::Allow,
+        arches: &[Arch::X86_64],
+        rules: &rules,
+        fail_unknown_syscall: false,
+    };
+    let mut compiler = Compiler::new();
+    let program = compiler.compile(&profile).expect("compile");
+
+    assert_eq!(
+        evaluate(
+            program,
+            Arch::X86_64.audit_token(),
+            Arch::X86_64.highest_number() + 1,
+            &[0; 6]
+        ),
+        Action::Allow.to_ret(),
+        "an allowing profile allows a call it has never heard of"
+    );
+}
+
+/// The guard still fires when the profile lists the architectures a stock
+/// one does.
+///
+/// Two of them share an audit token and number their calls in different
+/// ranges: the x32 interface sets a high bit, so every one of its numbers
+/// sits above every ordinary one. A single bound taken across both would be
+/// above everything x86-64 will ever use, and the guard would never fire
+/// for the architecture it was written for.
+#[test]
+fn the_absent_syscall_guard_survives_a_shared_token() {
+    const ENOSYS: u16 = 38;
+    const X32_BIT: u32 = 0x4000_0000;
+
+    let names = ["read", "write"];
+    let rules = [Rule {
+        names: &names,
+        action: Action::Allow,
+        args: &[],
+    }];
+    let profile = Profile {
+        default_action: Action::Errno(1),
+        arches: &[Arch::X86_64, Arch::X86, Arch::X32],
+        rules: &rules,
+        fail_unknown_syscall: false,
+    };
+    let mut compiler = Compiler::new();
+    let program = compiler.compile(&profile).expect("compile");
+    let arch = Arch::X86_64.audit_token();
+
+    let beyond = Arch::X86_64.highest_number() + 1;
+    assert!(beyond < X32_BIT, "the ordinary range is the low one");
+    assert_eq!(
+        evaluate(program, arch, beyond, &[0; 6]),
+        Action::Errno(ENOSYS).to_ret(),
+        "a new x86-64 call is still reported as one the kernel lacks"
+    );
+
+    // The other range keeps its own bound: a call it does carry is judged
+    // by the profile rather than reported absent.
+    let known = syscall_number(Arch::X32, "mount");
+    assert!(known >= X32_BIT, "that range is the high one");
+    assert_eq!(
+        evaluate(program, arch, known, &[0; 6]),
+        Action::Errno(1).to_ret(),
+        "a call the tables carry takes the profile's default"
+    );
+    assert_eq!(
+        evaluate(program, arch, Arch::X32.highest_number() + 1, &[0; 6]),
+        Action::Errno(ENOSYS).to_ret(),
+        "and a number above that range is absent too"
+    );
 }

@@ -62,7 +62,11 @@ fn payload(metadata: &str, record: &Record) -> String {
     json.string_array("fds", ["seccompFd"]);
     json.number(Some("pid"), i64::from(record.pid));
     json.string(Some("metadata"), metadata);
-    json.string(
+    // The state is an object in this document, not a string holding one. An
+    // agent reads the whole payload into the structure the specification
+    // defines, and a string where an object belongs fails that outright,
+    // leaving every syscall the profile hands over suspended.
+    json.document(
         Some("state"),
         &crate::state::render_public(record, crate::state::observe(record)),
     );

@@ -101,6 +101,15 @@ struct NameRef {
     slot: u32,
 }
 
+/// The bit the x32 interface sets in every one of its syscall numbers.
+const X32_BIT: u32 = 0x4000_0000;
+
+/// The error a kernel that never had a syscall reports for it.
+const ENOSYS: u16 = 38;
+
+/// The highest argument a condition can compare, since a syscall takes six.
+const MAX_ARG_INDEX: u8 = 5;
+
 /// A reusable seccomp filter compiler.
 ///
 /// The caller owns one of these and reuses it, so compiling a filter after the
@@ -149,11 +158,19 @@ impl Compiler {
         self.resolve_names(profile)?;
 
         let groups = group_by_token(arches)?;
-        let default = self.program.label();
+        // Both are shared with any rule asking for the same action, so the
+        // dispatch guard costs an instruction only when nothing else kills.
+        let default = self.action_label(profile.default_action);
+        let foreign = self.action_label(Action::KillProcess);
 
-        // Architecture dispatch. An architecture the profile does not name
-        // reaches the default action, which is how a filter built for x86-64
-        // alone still constrains a 32-bit process.
+        // Architecture dispatch. A call arriving on an architecture the
+        // profile does not name cannot be judged by the profile at all: the
+        // syscall numbers it was written against mean other calls on that
+        // ABI, so every rule in it is about something else. Handing such a
+        // call the profile's default action would let a profile whose default
+        // is permissive drop its own restrictions for any process that
+        // switches ABI, which is the one outcome a filter must never have.
+        // The process is killed instead.
         self.program.load(data::ARCH)?;
         let mut blocks: [Option<(u32, Label)>; MAX_GROUPS] = [None; MAX_GROUPS];
         for (slot, token) in blocks.iter_mut().zip(groups.iter().flatten()) {
@@ -161,17 +178,16 @@ impl Compiler {
             self.program.branch(JMP_JEQ_K, *token, label)?;
             *slot = Some((*token, label));
         }
-        self.program.jump(default)?;
+        self.program.jump(foreign)?;
 
         for &(token, label) in blocks.iter().flatten() {
             self.program.place(label)?;
             self.program.load(data::NR)?;
+            self.emit_unborn_guard(arches, token, profile.default_action)?;
             self.build_entries(arches, token, profile.default_action)?;
             self.emit_group(default)?;
         }
 
-        self.program.place(default)?;
-        self.program.ret(profile.default_action.to_ret())?;
         // Split the borrow: the returns are read while the program is written.
         let (program, returns) = (&mut self.program, &self.returns);
         for &(ret, label) in returns {
@@ -180,6 +196,68 @@ impl Compiler {
         }
 
         self.program.finish()
+    }
+
+    /// Answers a call the tables have never heard of with `ENOSYS`.
+    ///
+    /// A syscall number above everything the tables carry is one the kernel
+    /// gained after they were generated, so no rule in the profile is about
+    /// it and the profile's author never decided anything for it. Answering
+    /// with the default denial tells a caller the call exists and is
+    /// forbidden, and a library probing for a newer interface takes that as
+    /// a permanent refusal rather than as an old kernel: it stops instead of
+    /// falling back to the interface it has been using all along. `ENOSYS`
+    /// is what an older kernel says, which is the truth here.
+    ///
+    /// Nothing is emitted when the default allows, because then the new call
+    /// is allowed and there is nothing to tell apart.
+    ///
+    /// One group can hold two architectures that share an audit token and
+    /// number their calls in different ranges: the x32 interface sets the
+    /// bit below, so its numbers all sit above every ordinary one. Taking
+    /// the highest of the two would put the bound above every number the
+    /// ordinary interface will ever use, and the guard would never fire for
+    /// the architecture it was written for. The two ranges are therefore
+    /// bounded separately.
+    fn emit_unborn_guard(
+        &mut self,
+        arches: &[Arch],
+        token: u32,
+        default_action: Action,
+    ) -> Result<()> {
+        if matches!(default_action, Action::Allow | Action::Log) {
+            return Ok(());
+        }
+        let (mut plain, mut extended) = (0, 0);
+        for arch in arches {
+            if arch.audit_token() != token {
+                continue;
+            }
+            let highest = arch.highest_number();
+            if highest & X32_BIT == 0 {
+                plain = plain.max(highest);
+            } else {
+                extended = extended.max(highest);
+            }
+        }
+        if plain == 0 && extended == 0 {
+            return Ok(());
+        }
+        let unborn = self.action_label(Action::Errno(ENOSYS));
+
+        // Only one range in the group: one comparison answers for it.
+        if plain == 0 || extended == 0 {
+            return self.program.branch(JMP_JGT_K, plain.max(extended), unborn);
+        }
+
+        let wide = self.program.label();
+        let joined = self.program.label();
+        self.program.branch(JMP_JGE_K, X32_BIT, wide)?;
+        self.program.branch(JMP_JGT_K, plain, unborn)?;
+        self.program.jump(joined)?;
+        self.program.place(wide)?;
+        self.program.branch(JMP_JGT_K, extended, unborn)?;
+        self.program.place(joined)
     }
 
     /// Rejects names no architecture implements, when the profile asks for it.
@@ -214,7 +292,7 @@ impl Compiler {
             let first = u32::try_from(self.conditions.len())
                 .map_err(|_| Error::msg("seccomp: too many conditions"))?;
             for arg in rule.args {
-                if arg.index > 5 {
+                if arg.index > MAX_ARG_INDEX {
                     return Err(Error::msg(
                         "seccomp: argument index out of range",
                     ));
@@ -451,18 +529,84 @@ impl Compiler {
                 return self.program.jump(target);
             }
             let miss = self.program.label();
-            for offset in 0..rule.count {
-                let Some(&cond) =
-                    self.conditions.get((rule.first + offset) as usize)
-                else {
-                    return Err(Error::msg("seccomp: condition out of range"));
-                };
-                self.emit_condition(&cond, miss)?;
-            }
+            self.emit_rule_conditions(rule.first, rule.count, miss)?;
             self.program.jump(target)?;
             self.program.place(miss)?;
         }
         self.program.jump(default)
+    }
+
+    /// Emits the conditions of one rule, jumping to `miss` when the rule does
+    /// not apply.
+    ///
+    /// Conditions on different arguments all have to hold: a rule naming both
+    /// a file descriptor and a flag describes one call, not two. Conditions
+    /// on the same argument are alternatives instead, because a configuration
+    /// listing two values for one argument is asking for either of them; read
+    /// as a conjunction they would describe an argument equal to two
+    /// different values, which no call can satisfy, and the rule would be
+    /// dead text that silently never fires.
+    fn emit_rule_conditions(
+        &mut self,
+        first: u32,
+        count: u32,
+        miss: Label,
+    ) -> Result<()> {
+        for index in 0..=MAX_ARG_INDEX {
+            let alternatives = self.count_conditions(first, count, index)?;
+            if alternatives == 0 {
+                continue;
+            }
+            // One alternative needs no rejoining point: failing it fails the
+            // rule, and `miss` already means that.
+            let satisfied = (alternatives > 1).then(|| self.program.label());
+            let mut seen = 0;
+            for offset in 0..count {
+                let cond = self.condition_at(first, offset)?;
+                if cond.index != index {
+                    continue;
+                }
+                seen += 1;
+                if seen == alternatives {
+                    self.emit_condition(&cond, miss)?;
+                    break;
+                }
+                let next = self.program.label();
+                self.emit_condition(&cond, next)?;
+                if let Some(satisfied) = satisfied {
+                    self.program.jump(satisfied)?;
+                }
+                self.program.place(next)?;
+            }
+            if let Some(satisfied) = satisfied {
+                self.program.place(satisfied)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// How many of a rule's conditions compare the given argument.
+    fn count_conditions(
+        &self,
+        first: u32,
+        count: u32,
+        index: u8,
+    ) -> Result<u32> {
+        let mut total = 0;
+        for offset in 0..count {
+            if self.condition_at(first, offset)?.index == index {
+                total += 1;
+            }
+        }
+        Ok(total)
+    }
+
+    /// One of a rule's conditions, by position within the rule.
+    fn condition_at(&self, first: u32, offset: u32) -> Result<ArgCmp> {
+        self.conditions
+            .get((first + offset) as usize)
+            .copied()
+            .ok_or_else(|| Error::msg("seccomp: condition out of range"))
     }
 
     /// Emits one argument comparison, jumping to `miss` when it fails.

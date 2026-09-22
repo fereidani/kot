@@ -92,6 +92,30 @@ impl Arch {
         }
     }
 
+    /// The highest syscall number this architecture's table carries.
+    ///
+    /// Anything above it is a call the kernel gained after these tables were
+    /// generated. That lets a filter answer for the two cases
+    /// separately: a call the tables know and the profile did not name, and
+    /// a call that did not exist when the profile was written.
+    #[must_use]
+    pub const fn highest_number(self) -> u32 {
+        let numbers = self.numbers();
+        let mut highest = 0;
+        let mut index = 0;
+        // Bounded by the table, whose length is fixed at compile time.
+        while index < numbers.len() {
+            // A column holds -1 where the architecture has no such call, and
+            // the magnitude of a positive number is the number itself.
+            let number = numbers[index];
+            if number > 0 && number.unsigned_abs() > highest {
+                highest = number.unsigned_abs();
+            }
+            index += 1;
+        }
+        highest
+    }
+
     /// Resolves a syscall name to its number on this architecture.
     ///
     /// Returns `None` both for names this build has never heard of and for
