@@ -29,10 +29,11 @@ megabyte with three direct dependencies.
 
 ## Install
 
-From crates.io:
+From crates.io, as the static binary the runtime is meant to be:
 
 ```bash
-cargo install kot
+rustup target add x86_64-unknown-linux-musl
+cargo install kot --target x86_64-unknown-linux-musl
 ```
 
 From source:
@@ -44,27 +45,21 @@ make
 sudo make install
 ```
 
-`make` builds the release binary and `sudo make install` copies it to
-`/usr/local/bin`, which is why that step needs root. Set `PREFIX` to install
-somewhere else and `DESTDIR` to stage it into a package root; `sudo make
-uninstall` removes it again.
+`make` builds the release binary, linked statically against musl for the
+host's architecture, and adds the musl target through `rustup` when it is
+missing. `sudo make install` copies the binary to `/usr/local/bin`, which is
+why that step needs root. Set `PREFIX` to install somewhere else and `DESTDIR`
+to stage it into a package root; `sudo make uninstall` removes it again.
 
 ```bash
 make PREFIX=/usr DESTDIR=/tmp/pkg install
 ```
 
-The binary `make` builds is linked statically against musl, so it needs the
-musl target for the host's architecture, which `rustup target add
-x86_64-unknown-linux-musl` installs. The runtime is executed twice per
-container, once as the driver and once as the container's init, and a
-dynamically linked build pays the loader both times: about a millisecond and
-a half per container, out of three and a half. `cargo build --release` on its
-own produces that dynamically linked build; to get the static one from
-`cargo install`, name the target:
-
-```bash
-cargo install kot --target x86_64-unknown-linux-musl
-```
+The static build matters because the runtime is executed twice per container,
+once as the driver and once as the container's init, and a dynamically linked
+build pays the loader both times: about a quarter of a container's start on
+the host it was measured on. `cargo build --release` and `cargo install kot`
+without a target produce that dynamically linked build.
 
 ## Usage
 
