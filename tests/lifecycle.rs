@@ -2439,3 +2439,38 @@ fn a_read_only_mount_takes_the_mounts_that_go_inside_it() {
     );
     assert_eq!(lines.next(), Some("1"), "/dev/pts should be mounted");
 }
+
+/// the directory at 0755 asked for.
+#[test]
+fn a_tmpfs_takes_the_mode_of_what_it_covers() {
+    if !privileged() {
+        return;
+    }
+    let bundle = Bundle::with_config(
+        "tmpfs-mode",
+        &["/usr/bin/stat", "-c%a", "/covered"],
+        |config| {
+            *config = config.replace(
+                r#"    { "destination": "/proc", "type": "proc", "source": "proc" },"#,
+                r#"    { "destination": "/proc", "type": "proc", "source": "proc" },
+    {
+      "destination": "/covered",
+      "type": "tmpfs",
+      "source": "tmpfs",
+      "options": ["nosuid", "nodev"]
+    },"#,
+            );
+        },
+    );
+    let covered = bundle.path().join("rootfs").join("covered");
+    std::fs::create_dir_all(&covered).expect("the directory to cover");
+    std::fs::set_permissions(
+        &covered,
+        std::os::unix::fs::PermissionsExt::from_mode(0o750),
+    )
+    .expect("the mode to be taken");
+
+    let output = bundle.runtime(&["run", &bundle.id()]);
+    expect_ok("run", &output);
+    assert_eq!(stdout(&output).trim(), "750");
+}

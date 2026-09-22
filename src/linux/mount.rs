@@ -954,6 +954,7 @@ impl Mount<'_> {
             }
         };
         let mount = mount.as_fd();
+        self.inherit_mode(mount)?;
         if let Some(userns) = self.idmap {
             let attr = MountAttr::default().idmap(userns);
             mountattr::mount_setattr_fd(mount, false, &attr)?;
@@ -962,6 +963,37 @@ impl Mount<'_> {
             self.copy_up(mount)?;
         }
         self.attach(mount)
+    }
+
+    /// Gives a new tmpfs the mode of the directory it covers.
+    ///
+    /// Only a tmpfs, and only where the configuration named no mode of its
+    /// own: a container that finds `/run` world writable where the image
+    /// shipped it at 0755 has a filesystem it never asked for. Every other
+    /// kind has a root the kernel decides, which a mode would override.
+    fn inherit_mode(&mut self, mount: BorrowedFd<'_>) -> Result<()> {
+        use rustix::fs::{AtFlags, Mode, chmodat, fstat};
+
+        if self.plan.text(self.op.fstype)? != "tmpfs" {
+            return Ok(());
+        }
+        let data = self.plan.text(self.op.data)?;
+        if data.split(',').any(|option| option.starts_with("mode=")) {
+            return Ok(());
+        }
+        let directory =
+            match self.resolver.open_directory(self.target, Create::Nothing) {
+                Ok(directory) => directory,
+                // Nothing to take a mode from, so the kernel's stands.
+                Err(e) if e.is_not_found() => return Ok(()),
+                Err(e) => return Err(e),
+            };
+        let stat = fstat(directory).context("mount: read the mount point")?;
+        let mode = Mode::from_raw_mode(stat.st_mode);
+        // The mount is still detached, so this names its own root rather
+        // than the directory underneath it.
+        chmodat(mount, c".", mode, AtFlags::empty())
+            .context("mount: set the mode of a new filesystem")
     }
 
     /// Attaches the host's cgroup tree in place of a superblock the kernel
