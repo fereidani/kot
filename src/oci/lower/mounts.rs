@@ -48,9 +48,11 @@ pub fn mount(
     if source.destination.is_empty() {
         return Err(Error::msg("mount: destination is required"));
     }
-    if !source.destination.starts_with('/') {
-        return Err(Error::msg("mount: destination must be absolute"));
-    }
+    // A destination that is not absolute is resolved from the container's
+    // root, which is where every other runtime puts it. The specification
+    // asks for an absolute path, but an image builder writing a `VOLUME`
+    // line the way Docker reads it produces destinations like `[/etc/foo`,
+    // and a container the rest of the ecosystem runs is not one to refuse.
 
     let mut options = Options::default();
     data.clear();

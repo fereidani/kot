@@ -2525,3 +2525,35 @@ fn an_overlay_mount_takes_every_lower_layer() {
         "both layers should be there: {text}"
     );
 }
+
+/// runs is not one to refuse.
+#[test]
+fn a_relative_mount_destination_is_resolved_from_the_root() {
+    if !privileged() {
+        return;
+    }
+    let bundle = Bundle::with_config(
+        "relative-destination",
+        &[
+            "/usr/bin/sh",
+            "-c",
+            "grep -c ' /odd/place ' /proc/self/mountinfo",
+        ],
+        |config| {
+            *config = config.replace(
+                r#"    { "destination": "/proc", "type": "proc", "source": "proc" },"#,
+                r#"    { "destination": "/proc", "type": "proc", "source": "proc" },
+    {
+      "destination": "odd/place",
+      "type": "tmpfs",
+      "source": "tmpfs",
+      "options": ["nosuid", "nodev"]
+    },"#,
+            );
+        },
+    );
+
+    let output = bundle.runtime(&["run", &bundle.id()]);
+    expect_ok("run", &output);
+    assert_eq!(stdout(&output).trim(), "1");
+}

@@ -47,9 +47,8 @@ pub fn spec(spec: &Spec<'_>) -> Result<()> {
 
     for mount in &spec.mounts {
         ensure!(
-            mount.destination.starts_with('/'),
-            "mount destination {} must be absolute",
-            mount.destination
+            !mount.destination.is_empty(),
+            "a mount destination must not be empty"
         );
     }
 
