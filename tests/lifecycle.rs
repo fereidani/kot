@@ -2611,3 +2611,30 @@ fn a_payload_that_may_not_be_executed_is_refused() {
         "the failure should name the payload: {text}"
     );
 }
+
+/// two entries, which would be the wrong one.
+#[test]
+fn listen_pid_replaces_the_one_that_was_there() {
+    if !privileged() {
+        return;
+    }
+    let bundle = Bundle::with_config(
+        "listen-pid",
+        &["/usr/bin/printenv"],
+        |config| {
+            *config = config.replace(
+                r#""env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]"#,
+                r#""env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LISTEN_FDS=1", "LISTEN_PID=4321"]"#,
+            );
+        },
+    );
+
+    let output = bundle.runtime(&["run", &bundle.id()]);
+    expect_ok("run", &output);
+    let text = stdout(&output);
+    let entries: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("LISTEN_PID="))
+        .collect();
+    assert_eq!(entries, ["LISTEN_PID=1"], "in: {text}");
+}

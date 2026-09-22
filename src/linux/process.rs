@@ -651,7 +651,24 @@ impl Command {
         }
         let mut text = crate::sys::path::Path::new();
         text.push_u64(u64::try_from(pid).unwrap_or(0))?;
+        // Whoever started the runtime may have set one of its own, and a
+        // payload reading the environment takes the first of two.
+        self.remove("LISTEN_PID");
         self.add("LISTEN_PID", text.as_bytes())
+    }
+
+    /// Drops every entry naming `name` from the environment.
+    fn remove(&mut self, name: &str) {
+        self.envp.retain(|&entry| {
+            if entry.is_null() {
+                return true;
+            }
+            // SAFETY: as `program`.
+            let text = unsafe { core::ffi::CStr::from_ptr(entry.cast()) };
+            text.to_bytes()
+                .strip_prefix(name.as_bytes())
+                .is_none_or(|rest| rest.first() != Some(&b'='))
+        });
     }
 
     /// Collects one string section as the pointers `execve` takes.
