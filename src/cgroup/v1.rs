@@ -107,7 +107,9 @@ fn lower_memory(memory: &Memory, out: &mut Writes<'_>) -> Result<()> {
 
 fn lower_cpu<'a>(cpu: &'a Cpu<'a>, out: &mut Writes<'a>) -> Result<()> {
     out.controller("cpu");
-    if let Some(shares) = cpu.shares {
+    // A share of zero is how tooling says it is not asking for a weight. The
+    // controller has no such value, so the write is left out instead.
+    if let Some(shares) = cpu.shares.filter(|shares| *shares != 0) {
         out.unsigned("cpu.shares", shares)?;
     }
     if let Some(period) = cpu.period {
@@ -142,12 +144,19 @@ fn lower_cpu<'a>(cpu: &'a Cpu<'a>, out: &mut Writes<'a>) -> Result<()> {
 }
 
 fn lower_block_io(io: &BlockIo, out: &mut Writes<'_>) -> Result<()> {
+    // Which file carries a weight depends on the scheduler attached to the
+    // device: the controller exposes the plain name under the older one and
+    // a name of its own under the newer. Naming both means the weight is
+    // applied on either host rather than only on the one this was written
+    // on, and a host with neither still fails.
     if let Some(weight) = io.weight {
         out.unsigned("blkio.weight", u64::from(weight))?;
+        out.or_named("blkio.bfq.weight")?;
     }
     if let Some(leaf) = io.leaf_weight {
         out.with_optional(true, |out| {
-            out.unsigned("blkio.leaf_weight", u64::from(leaf))
+            out.unsigned("blkio.leaf_weight", u64::from(leaf))?;
+            out.or_named("blkio.bfq.leaf_weight")
         })?;
     }
     for device in &io.weight_device {
@@ -155,6 +164,7 @@ fn lower_block_io(io: &BlockIo, out: &mut Writes<'_>) -> Result<()> {
             out.build_append("blkio.weight_device", |buf| {
                 device_value(buf, device.major, device.minor, u64::from(weight))
             })?;
+            out.or_named("blkio.bfq.weight_device")?;
         }
         if let Some(leaf) = device.leaf_weight {
             out.with_optional(true, |out| {
@@ -165,7 +175,8 @@ fn lower_block_io(io: &BlockIo, out: &mut Writes<'_>) -> Result<()> {
                         device.minor,
                         u64::from(leaf),
                     )
-                })
+                })?;
+                out.or_named("blkio.bfq.leaf_weight_device")
             })?;
         }
     }

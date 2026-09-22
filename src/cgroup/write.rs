@@ -63,6 +63,8 @@ pub struct Write<'a> {
     /// True when a failure is not fatal, because the controller may simply not
     /// be compiled into this kernel.
     pub optional: bool,
+    /// Another name for the same knob, tried when the first is not there.
+    pub alias: Option<NameBuf>,
     /// True when the value is appended rather than replacing the file, which
     /// the legacy device and throttle files need.
     pub append: bool,
@@ -130,6 +132,7 @@ impl<'a> Writes<'a> {
             value,
             optional: self.optional,
             append,
+            alias: None,
         });
     }
 
@@ -139,6 +142,17 @@ impl<'a> Writes<'a> {
         value: Value<'a>,
         append: bool,
     ) -> Result<()> {
+        // A cgroup attribute is one name in one directory, and every write is
+        // an `openat` relative to that directory. A name carrying a separator
+        // is a path instead: an absolute one makes the kernel ignore the
+        // directory entirely, and a relative one walks wherever it says. The
+        // `unified` section of the configuration is caller-supplied text that
+        // arrives here unchanged, so this is where it stays an attribute.
+        if file.is_empty() || file.as_bytes().contains(&b'/') {
+            return Err(Error::msg(
+                "cgroup: an attribute name must be one component",
+            ));
+        }
         let file = NameBuf::from(file.as_bytes())?;
         self.push(file, value, append);
         Ok(())
@@ -152,6 +166,21 @@ impl<'a> Writes<'a> {
     /// Records a write of a rendered value.
     pub fn rendered(&mut self, file: &str, value: ValueBuf) -> Result<()> {
         self.record(file, Value::Rendered(value), false)
+    }
+
+    /// Gives the write just recorded a second name to try.
+    ///
+    /// Some knobs are named after the scheduler the kernel attached to the
+    /// device, so the file a host exposes depends on that rather than on
+    /// the configuration. The value is written once, to whichever name is
+    /// there; a knob that is absent under both still fails.
+    pub fn or_named(&mut self, alias: &str) -> Result<()> {
+        let alias = NameBuf::from(alias.as_bytes())?;
+        let Some(entry) = self.entries.last_mut() else {
+            return Err(Error::msg("cgroup: no write to give a name to"));
+        };
+        entry.alias = Some(alias);
+        Ok(())
     }
 
     /// Records a hugepage limit.
@@ -262,12 +291,26 @@ fn built(render: impl FnOnce(&mut ValueBuf) -> Result<()>) -> Result<ValueBuf> {
 /// relative to a descriptor rather than a fresh path resolution.
 pub fn apply(directory: BorrowedFd<'_>, writes: &[Write<'_>]) -> Result<()> {
     for write in writes {
-        let outcome = write_one(
+        let mut outcome = write_one(
             directory,
             write.file.as_c_str(),
             write.value.as_bytes(),
             write.append,
         );
+        // The same knob has more than one name on some hosts, because the
+        // scheduler attached to the device decides which file the
+        // controller exposes. A knob that is simply absent still fails
+        // below; only the name is being retried, not the failure.
+        if let (Err(e), Some(alias)) = (&outcome, write.alias.as_ref()) {
+            if e.is_not_found() {
+                outcome = write_one(
+                    directory,
+                    alias.as_c_str(),
+                    write.value.as_bytes(),
+                    write.append,
+                );
+            }
+        }
         match outcome {
             Ok(()) => {}
             // A controller the kernel does not implement cannot be configured,
@@ -318,4 +361,44 @@ pub fn read_one(
     )
     .context("cgroup: open file")?;
     rustix::io::read(&fd, out).context("cgroup: read")
+}
+
+/// How many reads one cgroup file may take before the loop gives up.
+///
+/// Each pass takes at least one byte, and the largest of these files is a
+/// process list; a thousand passes of the buffer below is more than any real
+/// container produces and still bounds a file that never ends.
+const MAX_READS: u32 = 1024;
+
+/// Reads a whole cgroup file, appending it to `out`.
+///
+/// The process list is the one file here that outgrows a fixed buffer: a
+/// container with a few thousand processes writes more than a single read
+/// returns, and stopping at the first read would silently lose the rest of
+/// them.
+pub fn read_all(
+    directory: BorrowedFd<'_>,
+    file: &core::ffi::CStr,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    use rustix::fs::{Mode, OFlags};
+
+    let fd = rustix::fs::openat(
+        directory,
+        file,
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .context("cgroup: open file")?;
+
+    let mut buffer = [0u8; 8192];
+    for _ in 0..MAX_READS {
+        let read =
+            rustix::io::read(&fd, &mut buffer).context("cgroup: read")?;
+        if read == 0 {
+            return Ok(());
+        }
+        out.extend_from_slice(buffer.get(..read).unwrap_or(&[]));
+    }
+    Err(Error::msg("cgroup: file did not end"))
 }

@@ -29,9 +29,9 @@ use crate::{
         v1, v2,
         write::{self, Writes},
     },
-    oci::spec::Resources,
+    oci::spec::{Memory, Resources},
     sys::{
-        error::{Error, Result},
+        error::{Context, Error, Result},
         path::Path,
     },
 };
@@ -381,7 +381,11 @@ impl Manager {
         for (controller, point) in mounts.points() {
             let path = layout::controller_path(point, &relative)?;
             let opened = if create {
-                Some(layout::open_or_create(&path)?)
+                let fd = layout::open_or_create(&path)?;
+                if controller == "cpuset" {
+                    layout::seed_cpuset(point, &relative)?;
+                }
+                Some(fd)
             } else {
                 layout::open_directory(&path).ok()
             };
@@ -410,6 +414,20 @@ impl Manager {
             return Err(Error::msg("cgroup: not created"));
         }
         Ok(true)
+    }
+
+    /// Whether there is a cgroup to read figures out of.
+    ///
+    /// Unlike the check above, a container whose cgroup has gone is not an
+    /// error here: a caller asking what a container is using while it exits
+    /// gets no figures rather than a failure, and it was going to see the
+    /// container stop on its next look anyway.
+    pub fn ready_for_stats(&mut self) -> Result<bool> {
+        if self.kind == Kind::Disabled {
+            return Ok(false);
+        }
+        self.wait_ready()?;
+        Ok(self.opened())
     }
 
     /// The configured path, relative to whichever hierarchy root applies.
@@ -539,21 +557,40 @@ impl Manager {
 
     /// Writes the resource limits.
     pub fn apply(&mut self, resources: Option<&Resources<'_>>) -> Result<()> {
-        let (Kind::Cgroupfs | Kind::Systemd) = self.kind else {
+        let Some(resources) = resources else {
             return Ok(());
         };
-        let Some(resources) = resources else {
+        let (Kind::Cgroupfs | Kind::Systemd) = self.kind else {
+            // Cgroup management was turned off and the configuration still
+            // states limits. There is nowhere to put them, so the container
+            // runs without the restrictions it describes. Refusing would be
+            // the answer if this were the configuration's doing, but it is
+            // the caller's: they asked for no cgroup on the command line,
+            // over a bundle they may not control. Saying so is what keeps
+            // it from being silent.
+            if resources.are_requested() {
+                crate::log::warn(
+                    "the configuration states resource limits and cgroup \
+                     management is disabled, so none of them are applied",
+                );
+            }
             return Ok(());
         };
         if !self.ready()? {
             return Ok(());
         }
 
+        self.check_memory_headroom(resources)?;
+
         let mut writes = Writes::new();
         if self.layout.has_legacy() {
             v1::lower(resources, &mut writes)?;
         } else {
-            v2::lower(resources, &mut writes)?;
+            v2::lower(
+                resources,
+                &mut writes,
+                self.current_bandwidth(resources)?,
+            )?;
         }
 
         // The limits systemd owns are set through the unit. Writing the files
@@ -772,7 +809,85 @@ impl Manager {
         Ok(value.trim_ascii().starts_with(wanted))
     }
 
-    /// Reads the process ids in the cgroup into `out`.
+    /// Reads the CPU bandwidth in force, for an update naming half of it.
+    ///
+    /// `cpu.max` holds quota and period together, so writing it needs both.
+    /// A configuration that names one of them is changing that one, and the
+    /// other has to be carried over rather than reset to a default. Nothing
+    /// is read when the configuration names both, or neither.
+    fn current_bandwidth(
+        &self,
+        resources: &Resources<'_>,
+    ) -> Result<v2::Bandwidth> {
+        let mut current = v2::Bandwidth::default();
+        let Some(cpu) = resources.cpu.as_ref() else {
+            return Ok(current);
+        };
+        if cpu.quota.is_some() == cpu.period.is_some() {
+            return Ok(current);
+        }
+        let Some(directory) = self.place("") else {
+            return Ok(current);
+        };
+
+        let mut buffer = [0u8; 64];
+        let read = match write::read_one(directory, c"cpu.max", &mut buffer) {
+            Ok(read) => read,
+            // Nothing in force yet, so the defaults are the right answer.
+            Err(e) if e.is_not_found() => return Ok(current),
+            Err(e) => return Err(e),
+        };
+        let text = core::str::from_utf8(buffer.get(..read).unwrap_or(&[]))
+            .map_err(|_| Error::msg("cgroup: cpu.max is not UTF-8"))?;
+        let mut fields = text.split_whitespace();
+        // The kernel writes the word for no limit in the quota position, and
+        // an unparsable field leaves the value absent, which is the same
+        // thing as far as the write that follows is concerned.
+        current.quota = fields.next().and_then(|field| field.parse().ok());
+        current.period = fields.next().and_then(|field| field.parse().ok());
+        Ok(current)
+    }
+
+    /// Refuses a new memory limit the container is already over.
+    ///
+    /// Writing a limit below current usage does not fail. The kernel takes
+    /// it and then reclaims to make it true, or kills the container when it
+    /// cannot. A configuration setting `checkBeforeUpdate` is saying it
+    /// would rather the update be refused than have that happen, so the
+    /// usage is read first and nothing is written.
+    fn check_memory_headroom(&self, resources: &Resources<'_>) -> Result<()> {
+        let Some(memory) = resources.memory.as_ref() else {
+            return Ok(());
+        };
+        // Checked again by the decision itself; here it saves two reads on
+        // every update that did not ask for the check.
+        if memory.check_before_update != Some(true) {
+            return Ok(());
+        }
+        let legacy = self.layout.has_legacy();
+        let Some(directory) = self.place(if legacy { "memory" } else { "" })
+        else {
+            return Ok(());
+        };
+
+        let (used_file, swap_used_file) = if legacy {
+            (c"memory.usage_in_bytes", c"memory.memsw.usage_in_bytes")
+        } else {
+            (c"memory.current", c"memory.swap.current")
+        };
+        let used = read_amount(directory, used_file)?;
+        let swap_used = read_amount(directory, swap_used_file)?;
+        memory_headroom(memory, used, swap_used, legacy)
+    }
+
+    /// Reads the process ids in the cgroup, and in every cgroup below it,
+    /// into `out`.
+    ///
+    /// A process in a sub-cgroup is still in the container. `exec --cgroup`
+    /// puts one there by request, and a container managing its own tree puts
+    /// its own there; reading only the top level would leave them running
+    /// after a signal meant for every process, and invisible to a caller
+    /// asking what is in the container.
     pub fn processes(&mut self, out: &mut Vec<i32>) -> Result<()> {
         out.clear();
         if self.kind == Kind::Disabled {
@@ -782,17 +897,81 @@ impl Manager {
         let Some(directory) = self.places().next() else {
             return Ok(());
         };
-        let mut buf = [0u8; 8192];
-        let read = write::read_one(directory, c"cgroup.procs", &mut buf)?;
-        let text = core::str::from_utf8(buf.get(..read).unwrap_or(&[]))
-            .map_err(|_| Error::msg("cgroup: procs is not UTF-8"))?;
-        for line in text.split_whitespace() {
-            if let Ok(pid) = line.parse() {
-                out.push(pid);
-            }
-        }
-        Ok(())
+        let mut text = Vec::new();
+        collect_processes(directory, &mut text, out, 0)
     }
+}
+
+/// How deep a tree of sub-cgroups is walked.
+///
+/// Nesting is a container's own doing and has no reason to be deep. The
+/// bound is what keeps the walk below from recursing without end on a tree
+/// somebody is building while it is read, and it bounds the stack.
+const MAX_CGROUP_DEPTH: u32 = 16;
+
+/// Appends the processes in one cgroup and everything below it.
+///
+/// `text` is the caller's buffer for the file contents, reused down the
+/// walk so that a deep tree does not allocate once per level.
+fn collect_processes(
+    directory: BorrowedFd<'_>,
+    text: &mut Vec<u8>,
+    out: &mut Vec<i32>,
+    depth: u32,
+) -> Result<()> {
+    use rustix::fs::{FileType, Mode, OFlags};
+
+    text.clear();
+    write::read_all(directory, c"cgroup.procs", text)?;
+    let listed = core::str::from_utf8(text)
+        .map_err(|_| Error::msg("cgroup: procs is not UTF-8"))?;
+    for line in listed.split_whitespace() {
+        if let Ok(pid) = line.parse() {
+            out.push(pid);
+        }
+    }
+    if depth >= MAX_CGROUP_DEPTH {
+        // Stopping quietly here would tell a caller signalling every
+        // process that it had reached them all when it had not.
+        crate::log::warn(
+            "cgroup: the tree is nested deeper than this runtime walks, so \
+             some processes were not counted",
+        );
+        return Ok(());
+    }
+
+    // The directory is reopened for reading because the descriptor the
+    // manager holds was opened with `O_PATH`, which cannot be listed.
+    let listing = rustix::fs::openat(
+        directory,
+        c".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .context("cgroup: open the directory for listing")?;
+    let entries = rustix::fs::Dir::read_from(&listing)
+        .context("cgroup: read the directory")?;
+    for entry in entries {
+        let entry = entry.context("cgroup: read a directory entry")?;
+        if entry.file_type() != FileType::Directory {
+            continue;
+        }
+        let name = entry.file_name();
+        if name == c"." || name == c".." {
+            continue;
+        }
+        let child = rustix::fs::openat(
+            &listing,
+            name,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .context("cgroup: open a sub-cgroup")?;
+        // Safe to reuse: this level's contents were parsed above, and the
+        // call clears the buffer before filling it again.
+        collect_processes(child.as_fd(), text, out, depth + 1)?;
+    }
+    Ok(())
 }
 
 /// Turns a D-Bus error name into something worth reading.
@@ -851,6 +1030,7 @@ fn connection<'a>(
 fn open_sub(parent: BorrowedFd<'_>, name: &str) -> Result<OwnedFd> {
     use rustix::fs::{Mode, OFlags, mkdirat, openat};
 
+    crate::cgroup::layout::ensure_below(name.as_bytes())?;
     let mut path = crate::sys::path::PathBuf::<256>::new();
     for component in crate::sys::path::components(name.as_bytes()) {
         path.join(component)?;
@@ -1004,20 +1184,115 @@ fn enable_controllers(
     Ok(())
 }
 
-/// Spins until `ready` holds, and reports whether it did.
+/// How long to wait before the check after `turn`.
+///
+/// The first few turns do not wait at all: a scope usually appears within a
+/// handful of scheduling slots, and a sleep there would cost more than the
+/// thing being waited for. After that the pause doubles up to a few
+/// milliseconds, which for an eleven millisecond round trip is a handful of
+/// wakeups rather than the hundreds of thousands of yields it replaces.
+/// Those yields were time taken from the container being started, on exactly
+/// the busy or single-processor host where it is scarcest.
+#[must_use]
+pub fn backoff(turn: u32) -> Duration {
+    /// Turns that yield rather than sleep.
+    const SPINS: u32 = 8;
+    /// The first pause after those turns.
+    const FIRST: Duration = Duration::from_micros(50);
+    /// The longest a single pause may be.
+    const LONGEST: Duration = Duration::from_millis(2);
+
+    if turn < SPINS {
+        return Duration::ZERO;
+    }
+    let doublings = (turn - SPINS).min(16);
+    let pause = FIRST.saturating_mul(1u32 << doublings);
+    if pause > LONGEST { LONGEST } else { pause }
+}
+
+/// Waits until `ready` holds, and reports whether it did.
 ///
 /// Bounded twice over: by the deadline, and by an iteration count that keeps a
 /// pathological scheduler from spinning here forever.
 fn wait_until(mut ready: impl FnMut() -> Result<bool>) -> Result<bool> {
     let start = Instant::now();
-    for _ in 0..1_000_000u32 {
+    for turn in 0..100_000u32 {
         if ready()? {
             return Ok(true);
         }
         if start.elapsed() > SYSTEMD_DEADLINE {
             break;
         }
-        std::thread::yield_now();
+        let pause = backoff(turn);
+        if pause.is_zero() {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(pause);
+        }
     }
     Ok(false)
+}
+
+/// Reads a byte count from a cgroup file, treating an absent file and the
+/// kernel's "no limit" word as zero.
+///
+/// A controller the host did not mount accounts nothing, and a figure that
+/// cannot be read is not evidence that the container is over a limit.
+fn read_amount(
+    directory: BorrowedFd<'_>,
+    file: &core::ffi::CStr,
+) -> Result<u64> {
+    let mut buffer = [0u8; 32];
+    let read = match write::read_one(directory, file, &mut buffer) {
+        Ok(read) => read,
+        Err(e) if e.is_not_found() => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let text = core::str::from_utf8(buffer.get(..read).unwrap_or(&[]))
+        .map_err(|_| Error::msg("cgroup: usage is not UTF-8"))?;
+    Ok(text.trim().parse().unwrap_or(0))
+}
+
+/// Decides whether a memory update may be written, given what is in use.
+///
+/// The usage figures are read from the container's cgroup by the caller, so
+/// the decision itself is arithmetic and can be checked without one.
+///
+/// The configuration states `swap` as the total of memory and swap together.
+/// On the unified hierarchy that total is two counters; the legacy controller
+/// keeps the combined figure in one, so only the unified case adds them.
+pub fn memory_headroom(
+    memory: &Memory,
+    used: u64,
+    swap_used: u64,
+    legacy: bool,
+) -> Result<()> {
+    if memory.check_before_update != Some(true) {
+        return Ok(());
+    }
+    if let Some(limit) = memory.limit.filter(|limit| *limit >= 0) {
+        ensure_above(
+            limit,
+            used,
+            "cgroup: the new memory limit is below the memory in use",
+        )?;
+    }
+    if let Some(swap) = memory.swap.filter(|swap| *swap >= 0) {
+        let total = if legacy { swap_used } else { used + swap_used };
+        ensure_above(
+            swap,
+            total,
+            "cgroup: the new swap limit is below the memory in use",
+        )?;
+    }
+    Ok(())
+}
+
+/// Refuses a limit that is already below what is in use.
+fn ensure_above(limit: i64, used: u64, message: &'static str) -> Result<()> {
+    let limit = u64::try_from(limit).unwrap_or(0);
+    if limit >= used {
+        return Ok(());
+    }
+    Err(Error::msg(message))
 }

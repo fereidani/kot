@@ -5,7 +5,7 @@
 //! would put a `statfs` and a mount table scan on the critical path.
 
 use std::{
-    os::fd::OwnedFd,
+    os::fd::{AsFd as _, BorrowedFd, OwnedFd},
     sync::atomic::{AtomicU8, Ordering},
 };
 
@@ -167,11 +167,32 @@ pub fn unified_path(relative: &str) -> Result<Path> {
 /// Each legacy controller is a separate tree with its own mount point, so the
 /// same container occupies one directory per controller, never one overall.
 pub fn controller_path(point: &str, relative: &str) -> Result<Path> {
+    ensure_below(relative.as_bytes())?;
     let mut path = Path::from(point.as_bytes())?;
     for component in crate::sys::path::components(relative.as_bytes()) {
         path.join(component)?;
     }
     Ok(path)
+}
+
+/// Refuses a relative cgroup path that would climb out of what it is joined
+/// to.
+///
+/// The components are joined one at a time, which already reads a leading
+/// separator as nothing rather than as the filesystem root. A `..` is the
+/// remaining way out: it names the parent of the hierarchy node the caller
+/// meant, so the limits, the device rules and the process list the
+/// configuration asked for would land on a sibling container's cgroup, or on
+/// the root of the tree where they apply to everything on the host.
+pub fn ensure_below(relative: &[u8]) -> Result<()> {
+    for component in crate::sys::path::components(relative) {
+        if component == b".." {
+            return Err(Error::msg(
+                "cgroup: a path component of .. would leave the hierarchy",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Opens a cgroup directory, creating it and its parents when needed.
@@ -227,4 +248,55 @@ fn create_directories(path: &Path) -> Result<()> {
 
 fn from_io(error: &std::io::Error, context: &'static str) -> Error {
     Error::new(error.raw_os_error().unwrap_or(0), context)
+}
+
+/// Gives every cpuset directory on the way to a container something to run
+/// on.
+///
+/// A cpuset directory is created empty, and the controller refuses to take a
+/// process while either its CPU list or its memory node list is. The values
+/// are not inherited by the kernel: each new level starts blank and has to be
+/// filled in from the level above, which is why the whole path is walked
+/// rather than only its last component.
+///
+/// A level that already names something is left exactly as it is, so a
+/// configuration that sets `cpuset.cpus` keeps what it asked for. A parent
+/// that names nothing leaves nothing to copy, which happens on a host where
+/// the controller is mounted but unused; the container is no worse off than
+/// the cgroup it was going into.
+pub fn seed_cpuset(point: &str, relative: &str) -> Result<()> {
+    let mut path = Path::from(point.as_bytes())?;
+    let mut parent = open_directory(&path)?;
+
+    for component in crate::sys::path::components(relative.as_bytes()) {
+        path.join(component)?;
+        let child = open_directory(&path)?;
+        for file in [c"cpuset.cpus", c"cpuset.mems"] {
+            inherit_if_empty(parent.as_fd(), child.as_fd(), file)?;
+        }
+        parent = child;
+    }
+    Ok(())
+}
+
+/// Copies one cpuset value down a level, unless the level below has its own.
+fn inherit_if_empty(
+    parent: BorrowedFd<'_>,
+    child: BorrowedFd<'_>,
+    file: &core::ffi::CStr,
+) -> Result<()> {
+    use crate::cgroup::write::{read_one, write_one};
+
+    let mut buffer = [0u8; 4096];
+    let read = read_one(child, file, &mut buffer)?;
+    if !buffer.get(..read).unwrap_or(&[]).trim_ascii().is_empty() {
+        return Ok(());
+    }
+    let mut inherited = [0u8; 4096];
+    let read = read_one(parent, file, &mut inherited)?;
+    let value = inherited.get(..read).unwrap_or(&[]).trim_ascii();
+    if value.is_empty() {
+        return Ok(());
+    }
+    write_one(child, file, value, false)
 }

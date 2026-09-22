@@ -13,17 +13,39 @@ use crate::{
 /// The kernel's word for an absent limit.
 const MAX: &str = "max";
 
+/// The period the kernel itself uses when nothing has set one.
+const DEFAULT_PERIOD: u64 = 100_000;
+
+/// The CPU bandwidth already in force.
+///
+/// `cpu.max` states quota and period in one file, so a configuration naming
+/// only one of them still has to write a value for the other. Without the
+/// current pair to fall back on, updating a quota would also reset the period
+/// to the kernel's default, changing the fraction of the machine the
+/// container gets while appearing to change only its quota.
+///
+/// Both fields are empty when a container is being created, where there is
+/// nothing in force yet and the default period is the right answer.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Bandwidth {
+    /// Quota in microseconds per period, absent when unlimited.
+    pub quota: Option<i64>,
+    /// Period in microseconds.
+    pub period: Option<u64>,
+}
+
 /// Lowers a resource configuration into unified-hierarchy writes.
 pub fn lower<'a>(
     resources: &'a Resources<'a>,
     out: &mut Writes<'a>,
+    current: Bandwidth,
 ) -> Result<()> {
     out.clear();
     if let Some(memory) = resources.memory.as_ref() {
         lower_memory(memory, out)?;
     }
     if let Some(cpu) = resources.cpu.as_ref() {
-        lower_cpu(cpu, out)?;
+        lower_cpu(cpu, out, current)?;
     }
     if let Some(limit) = resources.pids_limit {
         out.signed("pids.max", limit, MAX)?;
@@ -33,6 +55,14 @@ pub fn lower<'a>(
     }
     for limit in &resources.hugepage_limits {
         out.hugepage(limit.page_size, ".max", limit.limit)?;
+        // Pages taken through a reservation are counted against a second
+        // limit of their own. Leaving it alone would let a workload that
+        // reserves its huge pages up front take more than the configuration
+        // allows. The file arrived later than the first one, so a kernel
+        // without it is tolerated rather than refused.
+        out.with_optional(true, |out| {
+            out.hugepage(limit.page_size, ".rsvd.max", limit.limit)
+        })?;
     }
     lower_rdma(resources, out)?;
 
@@ -96,18 +126,29 @@ fn lower_memory(memory: &Memory, out: &mut Writes<'_>) -> Result<()> {
     Ok(())
 }
 
-fn lower_cpu<'a>(cpu: &'a Cpu<'a>, out: &mut Writes<'a>) -> Result<()> {
-    if let Some(shares) = cpu.shares {
+fn lower_cpu<'a>(
+    cpu: &'a Cpu<'a>,
+    out: &mut Writes<'a>,
+    current: Bandwidth,
+) -> Result<()> {
+    // Tooling writes a share of zero to mean that it is not asking for a
+    // weight at all. Passing it on would ask the kernel for a weight outside
+    // the range it accepts, failing an update that meant to change nothing.
+    if let Some(shares) = cpu.shares.filter(|shares| *shares != 0) {
         out.unsigned("cpu.weight", shares_to_weight(shares))?;
     }
     if cpu.quota.is_some() || cpu.period.is_some() {
+        // Whichever half the configuration leaves out keeps the value it has
+        // now, so an update names only what it means to change.
+        let quota = cpu.quota.or(current.quota);
+        let period = cpu.period.or(current.period).unwrap_or(DEFAULT_PERIOD);
         out.build("cpu.max", |buf| {
-            match cpu.quota {
+            match quota {
                 Some(quota) if quota > 0 => buf.push_i64(quota)?,
                 _ => buf.push_str(MAX)?,
             }
             buf.push_str(" ")?;
-            buf.push_u64(cpu.period.unwrap_or(100_000))
+            buf.push_u64(period)
         })?;
     }
     if let Some(burst) = cpu.burst {
@@ -212,9 +253,37 @@ fn lower_block_io(io: &BlockIo, out: &mut Writes<'_>) -> Result<()> {
         out.rendered("io.max", buf)?;
     }
 
-    if io.leaf_weight.is_some() || !io.weight_device.is_empty() {
+    // A per-device weight goes on its own line in the same file as the
+    // default one. The file exists only where a weight-aware scheduler is
+    // attached to the device, so the write is tolerated rather than
+    // required: on a host without one there is no weighting to apply and no
+    // limit is being dropped.
+    for device in &io.weight_device {
+        let Some(weight) = device.weight else {
+            continue;
+        };
+        let mut buf = ValueBuf::new();
+        buf.push_i64(device.major)?;
+        buf.push_str(":")?;
+        buf.push_i64(device.minor)?;
+        buf.push_str(" ")?;
+        buf.push_u64(io_weight(weight))?;
+        out.with_optional(true, |out| {
+            out.rendered("io.weight", buf.clone())?;
+            // As on the legacy hierarchy, the file is named after the
+            // scheduler attached to the device.
+            out.or_named("io.bfq.weight")
+        })?;
+    }
+
+    // The leaf weight divides a cgroup's own share between its tasks and its
+    // children, which the unified hierarchy has no equivalent for. Accepting
+    // it would apply less than the configuration asked for.
+    if io.leaf_weight.is_some()
+        || io.weight_device.iter().any(|d| d.leaf_weight.is_some())
+    {
         return Err(Error::msg(
-            "blockIO: per-device weights are not available on cgroup v2",
+            "blockIO: leaf weights are not available on cgroup v2",
         ));
     }
     Ok(())
