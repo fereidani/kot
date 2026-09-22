@@ -788,28 +788,8 @@ fn map_id(file: &str, pid: i32, id: u32) -> Result<u32> {
     let path = format!("/proc/{pid}/{file}");
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {path}"))?;
-    for line in text.lines() {
-        let mut fields = line.split_ascii_whitespace();
-        let (Some(container), Some(host), Some(size)) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        let (Ok(container), Ok(host), Ok(size)) = (
-            container.parse::<u32>(),
-            host.parse::<u32>(),
-            size.parse::<u32>(),
-        ) else {
-            continue;
-        };
-        let offset = id.wrapping_sub(container);
-        if id >= container && offset < size {
-            return host
-                .checked_add(offset)
-                .context("the mapping runs past the end of the id space");
-        }
-    }
-    bail!("the id {id} is outside the container's {file}")
+    crate::sys::process::translate_id(&text, id)
+        .with_context(|| format!("the id {id} is outside the {file}"))
 }
 
 /// Decides where the container's terminal goes, if it asks for one.

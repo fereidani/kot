@@ -85,3 +85,32 @@ fn a_malformed_cpu_list_is_refused() {
         "a CPU the mask cannot hold must be refused, not dropped"
     );
 }
+
+/// An id crosses a user namespace boundary as the map says, or not at all.
+///
+/// The translation decides which host user owns a device node the runtime
+/// makes for a container, and which user systemd is told is asking. An id
+/// the map does not cover has no answer, and saying so is the difference
+/// between a refusal and a node owned by whoever that id happens to be.
+#[test]
+fn an_id_translates_through_the_map_that_covers_it() {
+    use kot::sys::process::translate_id;
+
+    let map = "0 100000 65536\n";
+    assert_eq!(translate_id(map, 0), Some(100_000));
+    assert_eq!(translate_id(map, 65_535), Some(165_535));
+    assert_eq!(translate_id(map, 65_536), None);
+
+    // Several ranges, in the order the kernel writes them, including one
+    // that maps a single id somewhere else entirely.
+    let split = "0 1 1\n1 0 1\n2 2 4294967293\n";
+    assert_eq!(translate_id(split, 0), Some(1));
+    assert_eq!(translate_id(split, 1), Some(0));
+    assert_eq!(translate_id(split, 2), Some(2));
+
+    // A map that runs past the end of the id space describes no id at all,
+    // and a line that is not a mapping is skipped rather than believed.
+    assert_eq!(translate_id("0 4294967295 8\n", 4), None);
+    assert_eq!(translate_id("nonsense\n0 5 2\n", 1), Some(6));
+    assert_eq!(translate_id("", 0), None);
+}

@@ -160,6 +160,38 @@ fn wait_for_child(pid: i32) -> i32 {
     1
 }
 
+/// Translates an id through the contents of a `uid_map` or `gid_map`.
+///
+/// Each line is a container id, the host id it starts at, and how many ids
+/// the range covers. Answers `None` for an id no range holds, and for a map
+/// whose arithmetic does not fit the id space, which a kernel does not write
+/// but a reader has no way to rule out.
+#[must_use]
+pub fn translate_id(map: &str, id: u32) -> Option<u32> {
+    for line in map.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(inside), Some(outside), Some(count)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (Ok(inside), Ok(outside), Ok(count)) = (
+            inside.parse::<u32>(),
+            outside.parse::<u32>(),
+            count.parse::<u32>(),
+        ) else {
+            continue;
+        };
+        let Some(offset) = id.checked_sub(inside) else {
+            continue;
+        };
+        if offset < count {
+            return outside.checked_add(offset);
+        }
+    }
+    None
+}
+
 /// Executes the program that `fd` refers to.
 ///
 /// Taking the program as a descriptor rather than a path closes the window

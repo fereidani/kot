@@ -429,23 +429,5 @@ fn peer_identity() -> u32 {
     let Ok(map) = std::fs::read_to_string("/proc/self/uid_map") else {
         return inside;
     };
-    for line in map.lines() {
-        let mut fields = line.split_whitespace();
-        let (Some(first), Some(outside), Some(count)) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        let (Ok(first), Ok(outside), Ok(count)) = (
-            first.parse::<u32>(),
-            outside.parse::<u32>(),
-            count.parse::<u32>(),
-        ) else {
-            continue;
-        };
-        if inside >= first && inside - first < count {
-            return outside + (inside - first);
-        }
-    }
-    inside
+    crate::sys::process::translate_id(&map, inside).unwrap_or(inside)
 }

@@ -76,6 +76,24 @@ fn open_target(target: &str) -> anyhow::Result<File> {
         .map_err(|e| anyhow::anyhow!("opening the log file {path}: {e}"))
 }
 
+/// Renders a message as the one line a reader takes it for.
+///
+/// A message carries text from a configuration: a path, an identifier, a
+/// name. A line break in any of those would end the line early and leave
+/// what followed looking like a message of its own, which is how a log
+/// reader is made to see something the runtime never said. The JSON form
+/// escapes them itself, so this is only for the plain one.
+fn one_line(message: &str) -> std::borrow::Cow<'_, str> {
+    if !message.contains(|c: char| c.is_control()) {
+        return std::borrow::Cow::Borrowed(message);
+    }
+    let escaped = message
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    std::borrow::Cow::Owned(escaped)
+}
+
 /// Reports a failure.
 pub fn error(message: &str) {
     emit("error", message);
@@ -105,7 +123,7 @@ fn emit(level: &str, message: &str) {
         json.end_object();
         json.finish()
     } else {
-        format!("{level}: {message}\n")
+        format!("{level}: {}\n", one_line(message))
     };
 
     if let Some(sink) = SINK.get() {
