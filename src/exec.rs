@@ -378,10 +378,18 @@ fn supervise(
     // Only a process the clone could not place needs moving. The only way to
     // reach the error is a placement that was asked for and did not happen.
     if !in_cgroup {
-        let sub = options.cgroup.as_deref().unwrap_or_default();
-        manager
-            .add_process_in(payload, sub)
-            .context("placing the process in the container's cgroup")?;
+        let context = "placing the process in the container's cgroup";
+        match options.cgroup.as_deref() {
+            Some(sub) if !sub.is_empty() => {
+                manager.add_process_in(payload, sub).context(context)?;
+            }
+            // The container's own cgroup takes no process once the
+            // container has made cgroups below it, which is what a payload
+            // that manages its own does.
+            _ => manager
+                .add_process_beside(payload, record.pid)
+                .context(context)?,
+        }
     }
 
     // And the affinity it runs the caller's program under, which the

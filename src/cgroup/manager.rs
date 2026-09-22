@@ -687,6 +687,56 @@ impl Manager {
         open_sub(directory.as_fd(), sub).map(Some)
     }
 
+    /// Puts a process where the container's own process is.
+    ///
+    /// The unified hierarchy takes no process into a cgroup that has
+    /// children, so a container that makes cgroups of its own, such as one
+    /// running systemd, cannot be joined at the top. Its payload has moved
+    /// into a subtree, and a process joining the container belongs under
+    /// the same limits, which is where the payload is now.
+    ///
+    /// # Errors
+    ///
+    /// When the payload's cgroup cannot be read or the process cannot be
+    /// written into it.
+    pub fn add_process_beside(&mut self, pid: i32, payload: i32) -> Result<()> {
+        match self.subtree_of(payload)? {
+            Some(sub) => self.add_process_in(pid, &sub),
+            None => self.add_process(pid),
+        }
+    }
+
+    /// Where `pid` sits below the container's own cgroup, if it is below it.
+    ///
+    /// Read from the process itself rather than worked out from the plan,
+    /// because whatever moved it there is the container's business and the
+    /// runtime is not told about it.
+    fn subtree_of(&self, pid: i32) -> Result<Option<String>> {
+        if self.layout.has_legacy() {
+            // Only the unified hierarchy refuses a process in a cgroup with
+            // children, and a legacy tree has a path per controller rather
+            // than the one this reads.
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+            .map_err(|_| {
+                Error::msg("cgroup: cannot read the payload cgroup")
+            })?;
+        let Some(path) = text
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .map(|path| path.trim_start_matches('/'))
+        else {
+            return Ok(None);
+        };
+        let own = self.relative()?.trim_start_matches('/');
+        let Some(rest) = path.strip_prefix(own) else {
+            return Ok(None);
+        };
+        let rest = rest.trim_start_matches('/');
+        Ok((!rest.is_empty()).then(|| rest.to_owned()))
+    }
+
     /// Places a process in a directory below the container's cgroup.
     ///
     /// `exec --cgroup` asks for exactly this: a process that runs inside the
