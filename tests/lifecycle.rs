@@ -2655,3 +2655,29 @@ fn exec_reports_a_killed_command_as_killed() {
         bundle.runtime(&["exec", &id, "/usr/bin/sh", "-c", "kill -9 $$"]);
     assert_eq!(output.status.code(), Some(137));
 }
+
+/// waiting on.
+#[test]
+fn kill_sends_a_real_time_signal() {
+    if !privileged() {
+        return;
+    }
+    // A payload that is process one takes a signal only where it has a
+    // handler for it, so the payload installs one.
+    let bundle = Bundle::new(
+        "kill-realtime",
+        &["/usr/bin/sh", "-c", "trap 'exit 7' 64; sleep 30 & wait"],
+    );
+    let id = bundle.id();
+    expect_ok("create", &bundle.runtime(&["create", &id]));
+    expect_ok("start", &bundle.runtime(&["start", &id]));
+    assert!(wait_for_status(&bundle, "running"));
+
+    // The highest the kernel has, which is where a table of names runs out.
+    expect_ok("kill", &bundle.runtime(&["kill", &id, "64"]));
+    assert!(
+        wait_for_status(&bundle, "stopped"),
+        "the container should have taken the signal"
+    );
+    expect_ok("delete", &bundle.runtime(&["delete", &id]));
+}

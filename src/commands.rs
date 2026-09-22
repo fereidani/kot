@@ -247,6 +247,9 @@ fn send_signal(pid: i32, signal: u32) -> Result<()> {
 /// The errno is what tells a process that has already exited apart from one
 /// this runtime may not signal, and a caller signalling every process in a
 /// container has to treat those differently.
+/// Highest signal number the kernel has, which is the last real-time one.
+const LAST_SIGNAL: i32 = 64;
+
 fn signal_one(
     pid: i32,
     signal: u32,
@@ -256,11 +259,16 @@ fn signal_one(
         return Err(rustix::io::Errno::SRCH);
     };
     let number = i32::try_from(signal).unwrap_or(0);
-    // Every signal number the runtime can produce came from a name table, so
-    // it is one the kernel defines.
-    let Some(signal) = Signal::from_named_raw(number) else {
+    // The real-time signals have no names, so a table of named ones does not
+    // hold them, while the kernel takes every number in the range. An
+    // engine that asks for one of those is asking for something the
+    // container may well be waiting on.
+    if !(1..=LAST_SIGNAL).contains(&number) {
         return Err(rustix::io::Errno::INVAL);
-    };
+    }
+    // SAFETY: the number is in the range the kernel defines, checked just
+    // above, which is all this constructor asks of it.
+    let signal = unsafe { Signal::from_raw_unchecked(number) };
     kill_process(pid, signal)
 }
 
