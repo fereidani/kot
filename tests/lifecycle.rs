@@ -2260,3 +2260,74 @@ fn a_bind_of_a_file_into_a_user_namespace_lands_on_a_file() {
     expect_ok("run", &output);
     assert_eq!(stdout(&output).trim(), "kept");
 }
+
+/// the container cannot do it for itself.
+#[test]
+fn a_hard_limit_a_user_namespace_cannot_raise_is_raised_for_it() {
+    if !privileged() {
+        return;
+    }
+    const MAPPED_ROOT: u32 = 100_000;
+
+    let held = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    let Some(hard) = held.maximum else {
+        println!("skipping: the host has no hard limit to raise above");
+        return;
+    };
+    let wanted = hard + 1024;
+
+    let bundle = Bundle::with_config(
+        "userns-rlimit",
+        &["/usr/bin/sh", "-c", "ulimit -Hn"],
+        |config| {
+            in_user_namespace(config, MAPPED_ROOT);
+            *config = config.replace(
+                r#""rlimits": [{ "type": "RLIMIT_NOFILE", "hard": 4096, "soft": 4096 }]"#,
+                &format!(
+                    r#""rlimits": [{{ "type": "RLIMIT_NOFILE", "hard": {wanted}, "soft": {wanted} }}]"#
+                ),
+            );
+        },
+    );
+    std::os::unix::fs::chown(
+        bundle.path().join("rootfs"),
+        Some(MAPPED_ROOT),
+        Some(MAPPED_ROOT),
+    )
+    .expect("giving the root filesystem to the container's root");
+
+    let output = bundle.runtime(&["run", &bundle.id()]);
+    expect_ok("run", &output);
+    assert_eq!(stdout(&output).trim(), wanted.to_string());
+}
+
+/// may ask to be limited to, so a limit applied before that fails it.
+#[test]
+fn a_limit_below_the_handoff_block_still_starts_in_a_user_namespace() {
+    if !privileged() {
+        return;
+    }
+    const MAPPED_ROOT: u32 = 100_000;
+
+    let bundle = Bundle::with_config(
+        "userns-low-rlimit",
+        &["/usr/bin/sh", "-c", "ulimit -n"],
+        |config| {
+            in_user_namespace(config, MAPPED_ROOT);
+            *config = config.replace(
+                r#""hard": 4096, "soft": 4096"#,
+                r#""hard": 256, "soft": 256"#,
+            );
+        },
+    );
+    std::os::unix::fs::chown(
+        bundle.path().join("rootfs"),
+        Some(MAPPED_ROOT),
+        Some(MAPPED_ROOT),
+    )
+    .expect("giving the root filesystem to the container's root");
+
+    let output = bundle.runtime(&["run", &bundle.id()]);
+    expect_ok("run", &output);
+    assert_eq!(stdout(&output).trim(), "256");
+}

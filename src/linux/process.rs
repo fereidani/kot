@@ -20,6 +20,8 @@
 
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
+use rustix::process::Pid;
+
 use crate::{
     linux::mount::{Create, create_at},
     oci::plan::{Process, Section, View, codec::Str, process_flag},
@@ -42,6 +44,38 @@ pub fn apply_rlimits(plan: &View<'_>) -> Result<()> {
             maximum: (limit.hard != u64::MAX).then_some(limit.hard),
         };
         setrlimit(resource, value).context("rlimits: set")
+    })
+}
+
+/// Raises `target`'s hard limits to what the plan asks for.
+///
+/// Only the part the container cannot do for itself: lowering a limit and
+/// raising a soft one to the hard one need no privilege, raising a hard one
+/// does. Nothing is lowered here, since the process is still being built and
+/// a lower limit could fail a step it has yet to take.
+pub fn raise_rlimits(plan: &View<'_>, target: Pid) -> Result<()> {
+    use rustix::process::{Rlimit, getrlimit, prlimit};
+    plan.rlimits(|limit| {
+        let resource = resource_of(limit.resource)?;
+        // The plan says no limit with the largest value there is, which is
+        // what `None` means to the kernel.
+        let wanted = (limit.hard != u64::MAX).then_some(limit.hard);
+        let held = getrlimit(resource);
+        let raises = match (wanted, held.maximum) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(wanted), Some(held)) => wanted > held,
+        };
+        if !raises {
+            return Ok(());
+        }
+        let value = Rlimit {
+            current: held.current,
+            maximum: wanted,
+        };
+        prlimit(Some(target), resource, value)
+            .map(|_| ())
+            .context("rlimits: raise")
     })
 }
 

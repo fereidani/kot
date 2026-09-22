@@ -95,6 +95,16 @@ fn attempt(args: &InitArgs, socket: BorrowedFd<'_>) -> Result<Failure> {
         args,
     };
 
+    // A hard limit cannot be raised from inside a user namespace, so a
+    // process about to enter one takes its limits with it. The driver did
+    // that for a namespace the clone made; every other container applies
+    // them later, with the rest of the process settings.
+    if init.container.unshare_flags & CLONE_NEWUSER != 0
+        || joins_user_namespace(&plan)?
+    {
+        process::apply_rlimits(&plan)?;
+    }
+
     // Joining a pid namespace needs the same extra fork as creating one:
     // `setns` puts the caller's children in the namespace rather than the
     // caller, so without it an `exec` would run beside the container with the
@@ -447,6 +457,8 @@ impl Init<'_> {
             self.attach_terminal()?;
         }
 
+        // Applied again for a container that took them early, which costs
+        // nothing: setting a limit to what it already is needs no privilege.
         process::apply_rlimits(plan)?;
         process::apply_scheduling(plan, payload)?;
         process::enter_working_directory(plan, payload)?;

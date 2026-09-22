@@ -524,6 +524,14 @@ fn write_id_maps(
     Ok(())
 }
 
+/// Raises the hard limits the plan asks for, in the container's process.
+fn raise_rlimits(plan: &View<'_>, pid: i32) -> Result<()> {
+    let target = rustix::process::Pid::from_raw(pid)
+        .ok_or_else(|| anyhow::anyhow!("the container process has no id"))?;
+    crate::linux::process::raise_rlimits(plan, target)
+        .context("raising the container's resource limits")
+}
+
 /// Everything between the container's cgroup existing and its process being
 /// ready to run, which is the part a failure has to undo.
 fn configure(
@@ -547,6 +555,11 @@ fn configure(
     // unshared later exists only once init says it is ready.
     let clone_userns = container.clone_flags & CLONE_NEWUSER != 0;
     if clone_userns {
+        // A process born in a user namespace cannot raise its own hard
+        // limits, so that part is done from out here while it waits for its
+        // mapping. Only that part: init has yet to renumber its
+        // descriptors, and a lower limit would fail that.
+        raise_rlimits(request.plan, pid)?;
         write_id_maps(request, pid, container.deny_setgroups, socket)?;
     }
 
