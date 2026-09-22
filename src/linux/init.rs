@@ -463,6 +463,7 @@ impl Init<'_> {
         // Applied again for a container that took them early, which costs
         // nothing: setting a limit to what it already is needs no privilege.
         process::apply_rlimits(plan)?;
+        process::reset_signal_dispositions()?;
         process::apply_scheduling(plan, payload)?;
         process::enter_working_directory(plan, payload)?;
 

@@ -22,6 +22,9 @@ const SIG_BLOCK: usize = 0;
 /// `SIG_SETMASK`.
 const SIG_SETMASK: usize = 2;
 
+/// `SIG_DFL`.
+const SIG_DFL: usize = 0;
+
 /// `SIG_IGN`.
 const SIG_IGN: usize = 1;
 
@@ -145,10 +148,24 @@ struct Action {
     mask: u64,
 }
 
+/// Restores a signal's disposition to the kernel's default.
+///
+/// A disposition survives an execution when it is `SIG_IGN`, so a signal the
+/// runtime chose to ignore would be one the payload cannot be killed with.
+pub fn restore_default(signal: u32) -> Result<()> {
+    set_disposition(signal, SIG_DFL).context("signalfd: default")
+}
+
 /// Sets a signal's disposition to ignoring it.
 pub fn ignore(signal: u32) -> Result<()> {
+    set_disposition(signal, SIG_IGN).context("signalfd: ignore")
+}
+
+/// Points a signal at `handler`, which is a disposition rather than a
+/// function: this crate installs no handlers.
+fn set_disposition(signal: u32, handler: usize) -> Result<()> {
     let action = Action {
-        handler: SIG_IGN,
+        handler,
         flags: 0,
         restorer: 0,
         mask: 0,
@@ -166,5 +183,5 @@ pub fn ignore(signal: u32) -> Result<()> {
             core::mem::size_of::<u64>(),
         )
     };
-    ret_unit(r, "rt_sigaction").context("signalfd: ignore")
+    ret_unit(r, "rt_sigaction")
 }

@@ -108,6 +108,31 @@ fn resource_of(number: u32) -> Result<rustix::process::Resource> {
         .ok_or_else(|| Error::msg("rlimits: unknown limit"))
 }
 
+/// Restores every signal's disposition before the payload runs.
+///
+/// An ignored signal stays ignored across an execution, and the runtime
+/// ignores a broken pipe for its own sake, as does anything that may have
+/// started it. The payload would inherit that and be unable to be killed
+/// with a signal it never chose to ignore.
+pub fn reset_signal_dispositions() -> Result<()> {
+    /// Highest signal number the kernel has.
+    const LAST: u32 = 64;
+    /// `SIGKILL` and `SIGSTOP`, neither of which has a disposition to set.
+    const FIXED: [u32; 2] = [9, 19];
+
+    for signal in 1..=LAST {
+        if FIXED.contains(&signal) {
+            continue;
+        }
+        match crate::sys::signalfd::restore_default(signal) {
+            // The two the threading library keeps are refused by number.
+            Err(e) if e.errno() == crate::sys::error::EINVAL => {}
+            outcome => outcome?,
+        }
+    }
+    Ok(())
+}
+
 /// Applies scheduling, I/O priority, execution domain and memory policy.
 pub fn apply_scheduling(plan: &View<'_>, process: &Process) -> Result<()> {
     if process.has(process_flag::HAS_SCHEDULER) {

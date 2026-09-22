@@ -2557,3 +2557,25 @@ fn a_relative_mount_destination_is_resolved_from_the_root() {
     expect_ok("run", &output);
     assert_eq!(stdout(&output).trim(), "1");
 }
+
+/// inherited one cannot be killed with it.
+#[test]
+fn the_payload_inherits_no_ignored_signal() {
+    if !privileged() {
+        return;
+    }
+    let bundle = Bundle::new(
+        "signal-dispositions",
+        &["/usr/bin/grep", "SigIgn", "/proc/self/status"],
+    );
+    let output = bundle.runtime(&["run", &bundle.id()]);
+    expect_ok("run", &output);
+    let text = stdout(&output);
+    let mask = text
+        .split_whitespace()
+        .next_back()
+        .and_then(|field| u64::from_str_radix(field, 16).ok())
+        .unwrap_or_else(|| panic!("no signal mask in: {text}"));
+    // Bit twelve is `SIGPIPE`, which the runtime ignores for itself.
+    assert_eq!(mask & (1 << 12), 0, "SIGPIPE should not be ignored");
+}
