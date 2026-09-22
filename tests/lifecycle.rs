@@ -2474,3 +2474,54 @@ fn a_tmpfs_takes_the_mode_of_what_it_covers() {
     expect_ok("run", &output);
     assert_eq!(stdout(&output).trim(), "750");
 }
+
+/// on its own, or the mount is refused outright.
+#[test]
+fn an_overlay_mount_takes_every_lower_layer() {
+    if !privileged() {
+        return;
+    }
+    let layers = std::env::temp_dir().join(format!(
+        "kot-layers-{}-{}",
+        std::process::id(),
+        "overlay"
+    ));
+    let _ = std::fs::remove_dir_all(&layers);
+    for (name, file) in [("upper", "from-upper"), ("lower", "from-lower")] {
+        std::fs::create_dir_all(layers.join(name)).expect("a layer");
+        std::fs::write(layers.join(name).join(file), "x").expect("a file");
+    }
+    let lower = format!(
+        "{}:{}",
+        layers.join("upper").display(),
+        layers.join("lower").display()
+    );
+
+    let bundle = Bundle::with_config(
+        "overlay-layers",
+        &["/usr/bin/ls", "/layers"],
+        |config| {
+            *config = config.replace(
+                r#"    { "destination": "/proc", "type": "proc", "source": "proc" },"#,
+                &format!(
+                    r#"    {{ "destination": "/proc", "type": "proc", "source": "proc" }},
+    {{
+      "destination": "/layers",
+      "type": "overlay",
+      "source": "overlay",
+      "options": ["lowerdir={lower}"]
+    }},"#
+                ),
+            );
+        },
+    );
+
+    let output = bundle.runtime(&["run", &bundle.id()]);
+    let _ = std::fs::remove_dir_all(&layers);
+    expect_ok("run", &output);
+    let text = stdout(&output);
+    assert!(
+        text.contains("from-upper") && text.contains("from-lower"),
+        "both layers should be there: {text}"
+    );
+}

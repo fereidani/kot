@@ -738,6 +738,12 @@ fn create_filesystem(plan: &View<'_>, op: &MountOp) -> Result<OwnedFd> {
             fsconfig_set_flag(fs.as_fd(), option).context("mount: set flag")?;
             continue;
         };
+        // An overlay names its lower layers as one list, which the newer
+        // interface takes a layer at a time.
+        if key == "lowerdir" && value.contains(':') {
+            set_lower_layers(fs.as_fd(), value)?;
+            continue;
+        }
         fsconfig_set_string(fs.as_fd(), key, value)
             .context("mount: set option")?;
     }
@@ -759,6 +765,54 @@ fn create_filesystem(plan: &View<'_>, op: &MountOp) -> Result<OwnedFd> {
     let attrs = attr_flags(op.attr_set & !mountattr::ATTR_RDONLY);
     fsmount(fs.as_fd(), FsMountFlags::FSMOUNT_CLOEXEC, attrs)
         .context("mount: materialise")
+}
+
+/// Sets an overlay's lower layers, one at a time.
+///
+/// The one option string the older interface takes carries the layers
+/// separated by colons, with a colon in a name written `\\:`. The newer
+/// interface has no list, so each layer is appended on its own. A kernel
+/// without the appending form is given the list as it came.
+fn set_lower_layers(fs: BorrowedFd<'_>, list: &str) -> Result<()> {
+    use rustix::mount::fsconfig_set_string;
+
+    let mut layer = PathBuf::<{ crate::sys::path::PATH_MAX }>::new();
+    let mut escaped = false;
+    let mut first = true;
+    // Bounded by the list: each turn consumes one byte of it.
+    for byte in list.bytes().chain(core::iter::once(b':')) {
+        if escaped {
+            layer.push_bytes(&[byte])?;
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' => escaped = true,
+            b':' => {
+                if layer.is_empty() {
+                    continue;
+                }
+                let name = core::str::from_utf8(layer.as_bytes())
+                    .map_err(|_| Error::msg("mount: a layer is not text"))?;
+                match fsconfig_set_string(fs, "lowerdir+", name) {
+                    Ok(()) => {}
+                    Err(_) if first => {
+                        return fsconfig_set_string(fs, "lowerdir", list)
+                            .context("mount: set the lower layers");
+                    }
+                    Err(e) => {
+                        return Err(
+                            Error::from(e).describe("mount: set a lower layer")
+                        );
+                    }
+                }
+                first = false;
+                layer.clear();
+            }
+            _ => layer.push_bytes(&[byte])?,
+        }
+    }
+    Ok(())
 }
 
 /// Asks the driver to open a mount's source and hand it over.
