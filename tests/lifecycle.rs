@@ -2638,3 +2638,20 @@ fn listen_pid_replaces_the_one_that_was_there() {
         .collect();
     assert_eq!(entries, ["LISTEN_PID=1"], "in: {text}");
 }
+
+/// pass.
+#[test]
+fn exec_reports_a_killed_command_as_killed() {
+    if !privileged() {
+        return;
+    }
+    let bundle = Bundle::new("exec-killed", &["/usr/bin/sleep", "30"]);
+    let id = bundle.id();
+    expect_ok("create", &bundle.runtime(&["create", &id]));
+    expect_ok("start", &bundle.runtime(&["start", &id]));
+    assert!(wait_for_status(&bundle, "running"));
+
+    let output =
+        bundle.runtime(&["exec", &id, "/usr/bin/sh", "-c", "kill -9 $$"]);
+    assert_eq!(output.status.code(), Some(137));
+}

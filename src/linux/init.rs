@@ -591,7 +591,15 @@ fn wait_for(pid: i32) -> Result<Error> {
     for _ in 0..1024 {
         match waitpid(Some(pid), WaitOptions::empty()) {
             Ok(Some((_, status))) => {
-                let code = status.exit_status().unwrap_or(0);
+                // A process killed by a signal has no exit status of its
+                // own. Reporting zero for it would tell the caller it
+                // succeeded, so the convention every shell uses stands in.
+                let code =
+                    match (status.exit_status(), status.terminating_signal()) {
+                        (Some(code), _) => code,
+                        (None, Some(signal)) => 128 + signal,
+                        (None, None) => 0,
+                    };
                 #[allow(clippy::cast_possible_wrap)]
                 std::process::exit(code);
             }
