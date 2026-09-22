@@ -49,6 +49,14 @@ pub enum Kind {
     Mounted = 10,
     /// The driver has run the hooks that belong at this point.
     HooksRun = 11,
+    /// Init cannot create a device node itself and asks the driver to make
+    /// it, handing over the directory it belongs in.
+    ///
+    /// Carries the device's position in the plan, which the driver reads the
+    /// rest of the description from.
+    MakeDevice = 12,
+    /// The driver has created the device node init asked for.
+    DeviceMade = 13,
     /// Init could not do what it was asked.
     Failed = 8,
 }
@@ -66,6 +74,8 @@ impl Kind {
             9 => Some(Self::Configured),
             10 => Some(Self::Mounted),
             11 => Some(Self::HooksRun),
+            12 => Some(Self::MakeDevice),
+            13 => Some(Self::DeviceMade),
             _ => None,
         }
     }
@@ -76,7 +86,8 @@ impl Kind {
 pub struct Message {
     /// What the message means.
     pub kind: Kind,
-    /// A process id, for the messages that carry one.
+    /// A process id, or an index into the plan, for the messages that carry
+    /// one.
     pub pid: i32,
     /// The errno of a failure, or zero.
     pub errno: i32,

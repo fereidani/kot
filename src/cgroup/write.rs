@@ -317,6 +317,22 @@ pub fn apply(directory: BorrowedFd<'_>, writes: &[Write<'_>]) -> Result<()> {
             // and refusing to start for that reason would make the runtime
             // unusable on a stripped-down kernel.
             Err(_) if write.optional => {}
+            // An attribute that is not there is a controller that is not
+            // available in this cgroup, which a caller can do something
+            // about once it knows which one: the name goes in the log,
+            // since the error cannot carry it.
+            Err(e) if e.is_not_found() => {
+                crate::log::warn(&format!(
+                    "the cgroup attribute {} is not there, so the \
+                     controller it belongs to is not available in this \
+                     cgroup",
+                    write.file
+                ));
+                return Err(e.describe(
+                    "cgroup: the controller an attribute belongs to is not \
+                     available here",
+                ));
+            }
             Err(e) => return Err(e),
         }
     }

@@ -500,9 +500,33 @@ fn write_args_and_env(builder: &mut Builder, spec: &Spec<'_>) -> Result<()> {
             builder.records().str(value);
             open.advance();
         }
+        if section == Section::Env {
+            if let Some(handed) = handed_down_sockets(source) {
+                let value = builder.intern(&handed)?;
+                builder.records().str(value);
+                open.advance();
+            }
+        }
         builder.end(open)?;
     }
     Ok(())
+}
+
+/// The socket activation count the caller handed down, when it did.
+///
+/// A service manager passes the sockets it opened with `LISTEN_FDS`, and
+/// the program that uses them is the container's. The count travels in with
+/// it, and init adds the `LISTEN_PID` only it knows. A configuration that
+/// sets the variable itself is describing its own container and is left
+/// alone.
+fn handed_down_sockets(env: &[&str]) -> Option<String> {
+    const NAME: &str = "LISTEN_FDS";
+
+    if env.iter().any(|entry| entry.starts_with("LISTEN_FDS=")) {
+        return None;
+    }
+    let count = std::env::var(NAME).ok()?;
+    Some(format!("{NAME}={count}"))
 }
 
 fn write_mounts(
@@ -546,8 +570,14 @@ fn write_devices(
     let mut open = builder.begin(Section::Devices)?;
     if let Some(linux) = linux {
         for device in &linux.devices {
+            // A node cannot be a directory, so a trailing separator only
+            // leaves the path without a final component to create.
+            let path = device.path.trim_end_matches('/');
+            if path.is_empty() {
+                return Err(Error::msg("device: path names no node"));
+            }
             let op = DeviceOp {
-                path: builder.intern(device.path)?,
+                path: builder.intern(path)?,
                 kind: device
                     .kind
                     .as_bytes()

@@ -500,19 +500,31 @@ fn is_refusal(error: &std::io::Error) -> bool {
     matches!(error.raw_os_error(), Some(EACCES | EPERM | EROFS))
 }
 
-/// Rejects an identifier that would escape the state directory.
+/// Rejects an identifier that cannot safely become a name.
 ///
-/// An id becomes a directory name, so anything with a separator or a relative
-/// component in it is a path traversal waiting to happen.
+/// An id becomes a directory name under the state root, a cgroup path
+/// component and part of a systemd unit name, so it is held to what all
+/// three accept. A separator or a relative component is a path traversal, a
+/// leading dot hides the state directory, and a space or a quote turns a
+/// unit name into something else.
 pub fn validate_id(id: &str) -> Result<()> {
     if id.is_empty() {
-        bail!("container id must not be empty");
+        bail!("the container ID must not be empty");
     }
     if id == "." || id == ".." {
-        bail!("container id must not be a relative path component");
+        bail!("invalid container ID {id}: it names a directory above itself");
     }
-    if id.contains('/') || id.contains('\0') {
-        bail!("container id must not contain a path separator");
+    if id.starts_with('.') {
+        bail!("invalid container ID {id}: it must not start with a dot");
+    }
+    if let Some(bad) = id.chars().find(|c| {
+        !c.is_ascii_alphanumeric() && !matches!(c, '_' | '+' | '-' | '.')
+    }) {
+        bail!(
+            "invalid character {bad:?} in the container ID {id}: only \
+             letters, digits, and the marks `_`, `+`, `-` and `.` are \
+             accepted"
+        );
     }
     Ok(())
 }

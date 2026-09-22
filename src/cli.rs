@@ -39,9 +39,13 @@ pub enum LogFormat {
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Level {
     /// Only failures.
-    #[default]
     Error,
     /// Failures and things that might become failures.
+    ///
+    /// The default: the specification has the runtime warn about several
+    /// things it then carries on from, and a caller who never sees those
+    /// has no way to know they happened.
+    #[default]
     Warning,
     /// Everything.
     Debug,
@@ -135,8 +139,10 @@ pub enum Command {
     Features,
     /// Report the version.
     Version,
-    /// Print usage.
+    /// Print usage, either the whole of it or one command's.
     Help,
+    /// Print how one command is called.
+    CommandHelp(String),
     /// The container init process, which only the runtime itself invokes.
     Init {
         /// Encoded descriptor layout.
@@ -315,6 +321,98 @@ impl<'a> Args<'a> {
     }
 }
 
+/// Whether a command's own options include a request for its usage.
+fn asks_for_help(rest: &[String]) -> bool {
+    for word in rest {
+        // The conventional end of options, and the first plain word, both
+        // hand the remainder to the command.
+        if word == "--" || !word.starts_with('-') {
+            return false;
+        }
+        if word == "--help" || word == "-h" {
+            return true;
+        }
+    }
+    false
+}
+
+/// How one command is called, for `COMMAND --help`.
+///
+/// One entry per command: the line it is called on, and its options.
+const COMMAND_USAGE: [(&str, &str, &str); 18] = [
+    (
+        "create",
+        "create [options] CONTAINER",
+        "  --bundle PATH, --console-socket PATH, --pid-file PATH,\n  \
+         --preserve-fds N, --no-pivot, --no-new-keyring, --config NAME\n",
+    ),
+    (
+        "run",
+        "run [options] CONTAINER",
+        "  --bundle PATH, --console-socket PATH, --pid-file PATH,\n  \
+         --preserve-fds N, --no-pivot, --no-new-keyring, --detach,\n  \
+         --config NAME\n",
+    ),
+    ("start", "start CONTAINER", ""),
+    ("state", "state CONTAINER", ""),
+    (
+        "kill",
+        "kill [options] CONTAINER [SIGNAL]",
+        "  --all, --signal SIGNAL\n",
+    ),
+    ("delete", "delete [options] CONTAINER", "  --force\n"),
+    (
+        "exec",
+        "exec [options] CONTAINER cmd [args]",
+        "  --process PATH, --console-socket PATH, --pid-file PATH,\n  \
+         --cwd PATH, --env VAR=VALUE, --user UID[:GID], --cap CAP,\n  \
+         --preserve-fds N, --detach, --no-new-privs, --cgroup PATH,\n  \
+         --process-label LABEL, --apparmor PROFILE, --tty\n",
+    ),
+    (
+        "list",
+        "list [options]",
+        "  --quiet, --format text|json, --all\n",
+    ),
+    (
+        "ps",
+        "ps [options] CONTAINER [ps options]",
+        "  --format table|json\n",
+    ),
+    ("pause", "pause CONTAINER", ""),
+    ("resume", "resume CONTAINER", ""),
+    ("unpause", "unpause CONTAINER", ""),
+    (
+        "update",
+        "update [options] CONTAINER",
+        "  --resources PATH, and one option per limit\n",
+    ),
+    ("spec", "spec [options]", "  --bundle PATH, --rootless\n"),
+    (
+        "events",
+        "events [options] CONTAINER",
+        "  --interval SECONDS, --stats\n",
+    ),
+    ("features", "features", ""),
+    ("version", "version", ""),
+    (
+        "ls",
+        "ls [options]",
+        "  --quiet, --format text|json, --all\n",
+    ),
+];
+
+/// How a command is called, when the name is one.
+#[must_use]
+pub fn command_usage(name: &str) -> Option<String> {
+    COMMAND_USAGE
+        .iter()
+        .find(|(command, _, _)| *command == name)
+        .map(|(_, line, options)| {
+            format!("Usage: kot [global options] {line}\n{options}")
+        })
+}
+
 /// Parses a command line.
 #[allow(clippy::similar_names)]
 pub fn parse(argv: &[String]) -> Result<(Global, Command)> {
@@ -336,6 +434,14 @@ pub fn parse(argv: &[String]) -> Result<(Global, Command)> {
     };
 
     let rest = args.remainder();
+    // Every command answers `--help` with how it is called. Only its own
+    // options are read for it: past the first word that is not one,
+    // `kot exec ctr program --help` is asking that program, not this one.
+    if asks_for_help(rest) {
+        if let Some(usage) = command_usage(name) {
+            return Ok((global, Command::CommandHelp(usage)));
+        }
+    }
     let command = match name {
         "create" => Command::Create(parse_start(rest)?),
         "run" => Command::Run(parse_start(rest)?),

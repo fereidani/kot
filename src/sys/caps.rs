@@ -5,7 +5,7 @@
 //! ever handles the five `u64` masks below.
 
 use crate::sys::{
-    error::{EINVAL, Result},
+    error::{EINVAL, EPERM, Result},
     prctl,
     raw::{arg_ref, nr, ret_unit, syscall2},
 };
@@ -162,11 +162,73 @@ pub fn apply(sets: &CapSets) -> Result<()> {
     set_caps(sets.effective, sets.permitted, sets.inheritable)?;
 
     for cap in 0..=LAST_CAP {
-        if CapSets::has(sets.ambient, cap) {
-            prctl::raise_ambient_cap(cap)?;
+        if !CapSets::has(sets.ambient, cap) {
+            continue;
+        }
+        match prctl::raise_ambient_cap(cap) {
+            Ok(()) => {}
+            // The kernel admits a capability to the ambient set only from
+            // the permitted and the inheritable set together. Engines that
+            // copy `ambient` from `permitted` alone ask for one that is in
+            // neither, and refusing would reject their default bundle;
+            // granting it is not on offer, so the container runs with the
+            // privilege its other sets describe.
+            Err(e) if matches!(e.errno(), EPERM | EINVAL) => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(())
+}
+
+/// Carries this thread's capabilities through an `execve`.
+///
+/// The kernel keeps the permitted set across an execution only for a
+/// process whose effective id is root in its own user namespace, which a
+/// container init in a fresh one usually is not. The ambient set survives
+/// whatever the id is, and init replaces all of it with what the
+/// configuration asked for before the payload runs.
+pub fn preserve_across_exec() -> Result<()> {
+    let held = get_caps()?;
+    // A capability reaches the ambient set only from the permitted and the
+    // inheritable set together, so the inheritable one is widened first.
+    set_caps(held.effective, held.permitted, held.permitted)?;
+    for cap in 0..=LAST_CAP {
+        if !CapSets::has(held.permitted, cap) {
+            continue;
+        }
+        match prctl::raise_ambient_cap(cap) {
+            Ok(()) => {}
+            // A capability this build knows and the kernel does not cannot be
+            // held either, so there is nothing to carry over.
+            Err(e) if e.errno() == EINVAL => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Reads the calling thread's capability sets.
+///
+/// Three of the five: the bounding and ambient sets are read through
+/// `prctl` one capability at a time, and nothing here needs them, so they
+/// come back as zero.
+pub fn get_caps() -> Result<CapSets> {
+    let mut data = [CapData::default(); 2];
+    // SAFETY: `HEADER` declares version 3, which makes the kernel write
+    // exactly two `CapData` entries, and `data` provides them. Both outlive
+    // the call.
+    let r = unsafe {
+        syscall2(nr::CAPGET, arg_ref(&HEADER), data.as_mut_ptr() as usize)
+    };
+    ret_unit(r, "capget")?;
+    let join = |low: u32, high: u32| u64::from(low) | (u64::from(high) << 32);
+    Ok(CapSets {
+        effective: join(data[0].effective, data[1].effective),
+        permitted: join(data[0].permitted, data[1].permitted),
+        inheritable: join(data[0].inheritable, data[1].inheritable),
+        bounding: 0,
+        ambient: 0,
+    })
 }
 
 /// Installs the effective, permitted and inheritable sets.

@@ -21,9 +21,12 @@
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use crate::{
-    linux::mount::{
-        Create, Resolver, clone_path, create_at, move_onto, ok_if_exists,
-        open_directory,
+    linux::{
+        mount::{
+            Create, Resolver, clone_path, create_at, move_onto, ok_if_exists,
+            open_directory,
+        },
+        sync::{self, Kind, Message},
     },
     oci::plan::{
         Container, Section, View,
@@ -43,10 +46,11 @@ use crate::{
 /// previous mask is put back on the way out, because the payload inherits it
 /// and a container whose umask depended on how its devices were made would be
 /// a surprising thing to debug.
-struct NoUmask(rustix::fs::Mode);
+pub struct NoUmask(rustix::fs::Mode);
 
 impl NoUmask {
-    fn enter() -> Self {
+    #[must_use]
+    pub fn enter() -> Self {
         Self(rustix::process::umask(rustix::fs::Mode::empty()))
     }
 }
@@ -137,9 +141,18 @@ pub fn prepare(container: &Container, plan: &View<'_>) -> Result<()> {
 }
 
 /// Creates the device nodes and the links that go with them.
-pub fn create_devices(plan: &View<'_>, resolver: &mut Resolver) -> Result<()> {
+pub fn create_devices(
+    plan: &View<'_>,
+    resolver: &mut Resolver,
+    socket: BorrowedFd<'_>,
+) -> Result<()> {
     let _mask = NoUmask::enter();
-    plan.devices(|device| create_device(plan, resolver, &device))?;
+    let mut index = 0i32;
+    plan.devices(|device| {
+        let at = index;
+        index += 1;
+        create_device(plan, resolver, &device, at, socket)
+    })?;
 
     for (target, link) in DEV_SYMLINKS {
         link_at(resolver, target, link)?;
@@ -209,6 +222,8 @@ fn create_device(
     plan: &View<'_>,
     resolver: &mut Resolver,
     device: &DeviceOp,
+    index: i32,
+    socket: BorrowedFd<'_>,
 ) -> Result<()> {
     use rustix::fs::{FileType, Mode, mknodat};
 
@@ -253,10 +268,36 @@ fn create_device(
                 crate::sys::error::EPERM | crate::sys::error::EACCES
             ) =>
         {
-            bind_host_device(parent, name, path)
+            // The host's own node is the first choice: same device, and it
+            // costs nothing but a bind. A node the host does not have is
+            // one only the driver can make, and only that case asks it.
+            match bind_host_device(parent, name, path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.errno() == crate::sys::error::ENOENT => {
+                    request_device(socket, parent, index)
+                }
+                Err(e) => Err(e),
+            }
         }
         Err(e) => Err(Error::from(e).describe("device: create node")),
     }
+}
+
+/// Asks the driver for a device node this process cannot create.
+///
+/// Creating a character or block device is a privilege of the initial user
+/// namespace, which a container in one of its own does not hold however
+/// complete its mapping is. The directory goes with the request, so the
+/// driver never resolves a path inside the container.
+fn request_device(
+    socket: BorrowedFd<'_>,
+    parent: BorrowedFd<'_>,
+    index: i32,
+) -> Result<()> {
+    let request = Message::with_pid(Kind::MakeDevice, index);
+    sync::send_fd(socket, &request, parent)?;
+    sync::expect(socket, Kind::DeviceMade)?;
+    Ok(())
 }
 
 /// Binds the host's device node into the container.
@@ -267,14 +308,22 @@ fn bind_host_device(
 ) -> Result<()> {
     use rustix::fs::{Mode, OFlags, openat};
 
-    // An empty regular file is enough to mount over; the node's identity comes
-    // from the host side of the bind.
-    create_at(parent, name, Create::File, "device: create target")?;
-
+    // The host side comes first, so a host with no such node leaves the
+    // destination untouched for whoever tries next.
     let mut host = PathBuf::<256>::new();
     host.push_bytes(path)?;
     let tree =
         clone_path(host.as_c_str(), false, false, "device: clone host node")?;
+    // A bound node must not carry what a made one would not: no way to
+    // gain privilege, and nothing to execute.
+    let restrict = MountAttr::default()
+        .set(mountattr::ATTR_NOSUID | mountattr::ATTR_NOEXEC);
+    mountattr::mount_setattr_fd(tree.as_fd(), false, &restrict)
+        .context("device: restrict the bound node")?;
+
+    // An empty regular file is enough to mount over; the node's identity comes
+    // from the host side of the bind.
+    create_at(parent, name, Create::File, "device: create target")?;
     let destination =
         openat(parent, name, OFlags::PATH | OFlags::CLOEXEC, Mode::empty())
             .context("device: open target")?;

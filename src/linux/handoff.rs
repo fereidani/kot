@@ -21,10 +21,12 @@ use crate::sys::error::{Context, Error, Result};
 
 /// Where the runtime's own descriptors start.
 ///
-/// Above anything a caller can hand down through `--preserve-fds`, which the
-/// specification caps well below this, so the two blocks never collide and the
-/// renumbering below never has to move a target out of the way.
-pub const BASE: RawFd = 64;
+/// Above anything a caller hands down through `--preserve-fds`, which runs
+/// from three upwards, so renumbering never lands on a descriptor the
+/// container was promised; a count that would reach this far is refused by
+/// [`program_slot`]. Not higher, because every number here has to be one
+/// the process may hold under `RLIMIT_NOFILE`.
+pub const BASE: RawFd = 512;
 
 /// Descriptors init is given, in the order they are renumbered into.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -22,7 +22,7 @@ use crate::{
     },
     oci::plan::{Container, Process, View, process_flag},
     sys::{
-        clone::{CLONE_NEWNET, CloneSpec, Fork},
+        clone::{CLONE_NEWNET, CLONE_NEWUSER, CloneSpec, Fork},
         error::{Context, Error, Result},
         prctl,
         seccomp::SockFilter,
@@ -156,10 +156,10 @@ impl Init<'_> {
         // namespace.
         let pid = rustix::process::getpid().as_raw_nonzero().get();
         sync::send(self.socket, &Message::with_pid(Kind::Ready, pid))?;
-        if namespace::creates_user_namespace(
-            self.container.clone_flags,
-            self.container.unshare_flags,
-        ) {
+        // A user namespace the clone made was mapped before this process
+        // re-executed. Only one unshared afterwards still waits for its
+        // mapping.
+        if self.container.unshare_flags & CLONE_NEWUSER != 0 {
             sync::expect(self.socket, Kind::IdMapsWritten)?;
         }
 
@@ -172,6 +172,16 @@ impl Init<'_> {
             #[allow(clippy::cast_possible_wrap)]
             let signal = signal::SIGKILL as i32;
             prctl::set_pdeathsig(signal)?;
+        }
+
+        // The container leaves the runtime's process group, for two
+        // reasons: a group inherited across a pid namespace has no number
+        // there, and a container still in that group is sent every
+        // terminal signal twice, once by the terminal and once forwarded.
+        // A process that takes a terminal gets a session, and with it a
+        // group, a little later.
+        if !self.payload.has(process_flag::TERMINAL) {
+            process::start_process_group()?;
         }
 
         // An `exec` joins a container that already exists, so there is nothing
@@ -266,7 +276,7 @@ impl Init<'_> {
         if !in_cgroup_namespace {
             self.enter_cgroup_namespace()?;
         }
-        rootfs::create_devices(plan, &mut resolver)?;
+        rootfs::create_devices(plan, &mut resolver, self.socket)?;
 
         // The hooks that run inside the container but still resolve their own
         // paths on the host belong here, between the mounts existing and the
@@ -300,6 +310,12 @@ impl Init<'_> {
         rootfs::apply_sysctls(plan)?;
 
         rootfs::apply_paths(plan, &mut inside)?;
+
+        // Made here, while the root can still be written to: a read-only
+        // root says what the payload may write, not what the runtime may
+        // build for it.
+        process::create_working_directory(plan, &self.payload)?;
+
         if container.rootfs_readonly {
             rootfs::seal_root()?;
         }
@@ -339,7 +355,12 @@ impl Init<'_> {
     /// Applies the process settings and executes the payload.
     fn finish(&self) -> Result<Failure> {
         let (plan, payload) = (self.plan, &self.payload);
-        let command = process::Command::new(plan)?;
+        let mut command = process::Command::new(plan)?;
+        // The environment is completed before anything is resolved through
+        // it: the payload is looked up along the `PATH` it ends up with.
+        command.ensure_home(payload.uid)?;
+        let pid = rustix::process::getpid().as_raw_nonzero().get();
+        command.set_listen_pid(pid)?;
 
         // The terminal is created before privilege is dropped, because opening
         // the multiplexer and taking control of the session both need it.
@@ -366,6 +387,10 @@ impl Init<'_> {
         if !guarded {
             self.install_filter(&mut filter)?;
         }
+
+        // Before the change of user, which is the only moment the runtime
+        // still has the privilege to hand the streams over.
+        process::adopt_standard_streams(payload);
 
         process::narrow_capabilities(payload)?;
         process::drop_privileges(plan, payload)?;

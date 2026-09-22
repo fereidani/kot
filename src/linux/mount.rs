@@ -27,7 +27,7 @@ use crate::{
         record::{MountKind, MountOp, mount_flag},
     },
     sys::{
-        error::{Context, Error, Result},
+        error::{Context, EPERM, Error, Result},
         mountattr::{self, MountAttr},
         path::{Path, PathBuf},
     },
@@ -486,6 +486,11 @@ pub(crate) fn clone_path(
     open_tree(rustix::fs::CWD, source, flags).context(context)
 }
 
+/// True for either cgroup filesystem.
+fn is_cgroup(fstype: &str) -> bool {
+    matches!(fstype, "cgroup" | "cgroup2")
+}
+
 /// Establishes one mount.
 pub fn establish(
     plan: &View<'_>,
@@ -597,7 +602,21 @@ impl Mount<'_> {
             fsconfig_set_string(fs.as_fd(), "context", context)
                 .context("mount: set selinux context")?;
         }
-        fsconfig_create(fs.as_fd()).context("mount: create superblock")?;
+        match fsconfig_create(fs.as_fd()) {
+            Ok(()) => {}
+            // A fresh cgroup superblock needs privilege in the user
+            // namespace that owns the cgroup namespace the mounter is in,
+            // so a container in a user namespace of its own that kept the
+            // host's cgroup namespace cannot have one. What it can have is
+            // the tree the host already mounted, under the flags the plan
+            // asked for.
+            Err(e) if e.raw_os_error() == EPERM && is_cgroup(fstype) => {
+                return self.bind_host_cgroups();
+            }
+            Err(e) => {
+                return Err(Error::from(e).describe("mount: create superblock"));
+            }
+        }
 
         // `fsmount` takes every attribute a new mount can carry, so the only
         // thing left for `mount_setattr` is an id mapping. A fresh superblock
@@ -614,6 +633,47 @@ impl Mount<'_> {
             self.copy_up(mount.as_fd())?;
         }
         self.attach(mount.as_fd())
+    }
+
+    /// Attaches the host's cgroup tree in place of a superblock the kernel
+    /// refuses to create.
+    ///
+    /// Recursive, because the unified hierarchy carries its controllers in
+    /// mounts below the root. The plan's attributes still apply, so a
+    /// read-only cgroup mount stays read only.
+    fn bind_host_cgroups(&mut self) -> Result<()> {
+        let source = self.host_cgroup_path()?;
+        let tree = clone_path(
+            source.as_c_str(),
+            true,
+            false,
+            "mount: clone the host cgroup tree",
+        )?;
+        self.apply_attributes(tree.as_fd())?;
+        self.attach(tree.as_fd())
+    }
+
+    /// Where the host keeps the tree this mount asked for.
+    ///
+    /// The unified hierarchy is one filesystem at a fixed place; a version
+    /// one hierarchy is one per controller, named after it, which the
+    /// destination's last component names as well.
+    fn host_cgroup_path(&self) -> Result<PathBuf<256>> {
+        const ROOT: &[u8] = b"/sys/fs/cgroup";
+
+        let mut path = PathBuf::<256>::new();
+        path.push_bytes(ROOT)?;
+        if self.plan.text(self.op.fstype)? == "cgroup2" {
+            return Ok(path);
+        }
+        let controller = crate::sys::path::split_last(self.target)
+            .map_or(self.target, |(_, name)| name);
+        if controller.is_empty() {
+            return Err(Error::msg("mount: cgroup mount names no controller"));
+        }
+        path.push_bytes(b"/")?;
+        path.push_bytes(controller)?;
+        Ok(path)
     }
 
     /// Carries what the destination already holds into the new filesystem.

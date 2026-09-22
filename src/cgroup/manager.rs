@@ -1056,7 +1056,59 @@ fn remove_one(path: &Path) -> Result<()> {
     match rustix::fs::rmdir(path.as_c_str()) {
         Ok(()) => Ok(()),
         Err(e) if e.raw_os_error() == crate::sys::error::ENOENT => Ok(()),
+        // A container that made cgroups of its own leaves them as children
+        // of this one, and the kernel refuses to remove a cgroup that has
+        // any. They are inside the container's own cgroup, so removing
+        // them takes nothing that is not the container's.
+        Err(e) if e.raw_os_error() == crate::sys::error::EBUSY => {
+            remove_children(path);
+            match rustix::fs::rmdir(path.as_c_str()) {
+                Ok(()) => Ok(()),
+                Err(e) if e.raw_os_error() == crate::sys::error::ENOENT => {
+                    Ok(())
+                }
+                Err(e) => {
+                    Err(Error::from(e).describe("cgroup: remove directory"))
+                }
+            }
+        }
         Err(e) => Err(Error::from(e).describe("cgroup: remove directory")),
+    }
+}
+
+/// Removes every cgroup below `path`, deepest first.
+///
+/// Nothing is reported: a child that cannot be removed leaves the parent
+/// there too, which is what the caller sees. The depth bound guards against
+/// a hierarchy that keeps growing while it is walked.
+fn remove_children(path: &Path) {
+    /// How deep the walk goes before it gives up.
+    const MAX_DEPTH: usize = 16;
+
+    let mut level: Vec<std::path::PathBuf> =
+        vec![std::path::PathBuf::from(path.to_string())];
+    let mut found: Vec<std::path::PathBuf> = Vec::new();
+    for _ in 0..MAX_DEPTH {
+        let mut next = Vec::new();
+        for directory in &level {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    next.push(entry.path());
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        found.extend_from_slice(&next);
+        level = next;
+    }
+    // Deepest first, which is the only order the kernel accepts.
+    for directory in found.iter().rev() {
+        let _ = std::fs::remove_dir(directory);
     }
 }
 

@@ -33,21 +33,25 @@ macro_rules! syscall_numbers {
 
 syscall_numbers! {
     BPF = "`bpf(2)`", 321, 280;
+    CAPGET = "`capget(2)`", 125, 90;
     CAPSET = "`capset(2)`", 126, 91;
     CLONE3 = "`clone3(2)`", 435, 435;
     CLOSE_RANGE = "`close_range(2)`", 436, 436;
     DUP3 = "`dup3(2)`", 292, 24;
     EXECVEAT = "`execveat(2)`", 322, 281;
+    EXIT_GROUP = "`exit_group(2)`", 231, 94;
     IOPRIO_SET = "`ioprio_set(2)`", 251, 30;
     IOCTL = "`ioctl(2)`", 16, 29;
     KEYCTL = "`keyctl(2)`", 250, 219;
     MOUNT_SETATTR = "`mount_setattr(2)`", 442, 442;
     PERSONALITY = "`personality(2)`", 135, 92;
     PRCTL = "`prctl(2)`", 157, 167;
+    RT_SIGPROCMASK = "`rt_sigprocmask(2)`", 14, 135;
     SCHED_SETAFFINITY = "`sched_setaffinity(2)`", 203, 122;
     SCHED_SETATTR = "`sched_setattr(2)`", 314, 274;
     SECCOMP = "`seccomp(2)`", 317, 277;
     SETNS = "`setns(2)`", 308, 268;
+    SIGNALFD4 = "`signalfd4(2)`", 289, 74;
     SET_MEMPOLICY = "`set_mempolicy(2)`", 238, 237;
 }
 
@@ -166,6 +170,8 @@ syscall_arity! {
     syscall2(a, b), 0, 0, 0, 0;
     /// Issues a syscall with three arguments.
     syscall3(a, b, c), 0, 0, 0;
+    /// Issues a syscall with four arguments.
+    syscall4(a, b, c, d), 0, 0;
     /// Issues a syscall with five arguments.
     syscall5(a, b, c, d, e), 0;
 }

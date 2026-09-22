@@ -66,15 +66,6 @@ pub fn unshare(flags: u64) -> Result<bool> {
     Ok(flags & (CLONE_NEWPID | CLONE_NEWTIME) != 0)
 }
 
-/// Whether a container ends up in a user namespace the runtime created.
-#[must_use]
-pub const fn creates_user_namespace(
-    clone_flags: u64,
-    unshare_flags: u64,
-) -> bool {
-    (clone_flags | unshare_flags) & CLONE_NEWUSER != 0
-}
-
 /// Writes the id mapping files for a process in a new user namespace.
 ///
 /// The process cannot write these itself: the kernel requires the writer to

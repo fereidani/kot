@@ -51,7 +51,7 @@ use crate::{
         spec::Resources,
     },
     state::{LaterHooks, Record, Store},
-    sys::clone::{CloneSpec, Fork},
+    sys::clone::{CLONE_NEWUSER, CloneSpec, Fork},
 };
 
 /// What a successful creation produced.
@@ -302,12 +302,24 @@ pub(crate) fn spawn_sealed<T>(
     let (side, in_cgroup) =
         unsafe { spawn_placed(spawn, request.cgroup) }.context(creating)?;
 
+    // The kernel keeps capabilities across `execve` only for a process that
+    // is root in its own user namespace, and a namespace with no mapping
+    // written yet has no root. Executing before the driver has written one
+    // would leave init unprivileged in the namespace it owns.
+    let awaits_id_maps =
+        request.clone_flags.is_some_and(|f| f & CLONE_NEWUSER != 0);
+
     match side {
         Fork::Child => {
             // Anything that goes wrong here cannot be reported: the socket is
             // about to be renumbered and the process is about to be replaced.
             // Exiting with a distinctive code is all that is left.
-            let code = enter_sealed_image(&handoff, &args, sealed.as_fd());
+            let code = enter_sealed_image(
+                &handoff,
+                &args,
+                sealed.as_fd(),
+                awaits_id_maps,
+            );
             std::process::exit(code);
         }
         Fork::Parent(pid) => {
@@ -359,9 +371,25 @@ pub fn enter_sealed_image(
     handoff: &Handoff,
     args: &InitArgs,
     sealed: std::os::fd::BorrowedFd<'_>,
+    awaits_id_maps: bool,
 ) -> i32 {
     /// Exit code for a child that could not even reach the sealed image.
     const HANDOFF_FAILED: i32 = 125;
+
+    if awaits_id_maps {
+        let Some(socket) = handoff.sync.as_ref() else {
+            return HANDOFF_FAILED;
+        };
+        if sync::expect(socket.as_fd(), Kind::IdMapsWritten).is_err() {
+            return HANDOFF_FAILED;
+        }
+        // The mapping may give this process any container id, so the
+        // capabilities go into the one set that survives an execution
+        // whatever the id turns out to be.
+        if crate::sys::caps::preserve_across_exec().is_err() {
+            return HANDOFF_FAILED;
+        }
+    }
 
     if handoff.install().is_err() {
         return HANDOFF_FAILED;
@@ -439,6 +467,20 @@ fn supervise(
     })
 }
 
+/// Writes the id maps of a user namespace init cannot map itself, and tells
+/// init they are in place.
+fn write_id_maps(
+    request: &Request<'_>,
+    pid: i32,
+    deny_setgroups: bool,
+    socket: BorrowedFd<'_>,
+) -> Result<()> {
+    namespace::write_id_maps(request.plan, pid, deny_setgroups)
+        .context("writing the id mappings")?;
+    sync::send(socket, &Message::new(Kind::IdMapsWritten))?;
+    Ok(())
+}
+
 /// Everything between the container's cgroup existing and its process being
 /// ready to run, which is the part a failure has to undo.
 fn configure(
@@ -455,6 +497,15 @@ fn configure(
         ..
     } = request;
 
+    let container = request.plan.container()?;
+    // A namespace made by the clone is mapped before init reports in, since
+    // init is waiting to re-execute and cannot do that unmapped. One
+    // unshared later exists only once init says it is ready.
+    let clone_userns = container.clone_flags & CLONE_NEWUSER != 0;
+    if clone_userns {
+        write_id_maps(request, pid, container.deny_setgroups, socket)?;
+    }
+
     // The process id init reports is the one it sees, which inside a new pid
     // namespace is one. What the runtime needs, for waiting on it, for writing
     // its id maps, and for the state record, is the id in the runtime's own
@@ -466,14 +517,8 @@ fn configure(
         ready.pid
     ));
 
-    if lowered.creates_userns {
-        namespace::write_id_maps(
-            request.plan,
-            pid,
-            request.plan.container()?.deny_setgroups,
-        )
-        .context("writing the id mappings")?;
-        sync::send(socket, &Message::new(Kind::IdMapsWritten))?;
+    if lowered.creates_userns && !clone_userns {
+        write_id_maps(request, pid, container.deny_setgroups, socket)?;
     }
 
     settle_cgroup(manager, spec, lowered, socket, pid, in_cgroup)?;
@@ -496,57 +541,14 @@ fn configure(
     // These run in the runtime's own namespaces, after the container's exist,
     // which is the specification's `createRuntime` point.
     let state = crate::state::render_public(&record, status);
+    let where_ = hooks::Environment::new(request.bundle, &spec.annotations);
     if let Some(hooks) = spec.hooks.as_ref() {
-        hooks::run(&hooks.prestart, &state)?;
-        hooks::run(&hooks.create_runtime, &state)?;
+        hooks::run(&hooks.prestart, &state, &where_)?;
+        hooks::run(&hooks.create_runtime, &state, &where_)?;
     }
 
-    // Init stops once the container's filesystem exists and before its root
-    // changes, which is where `createContainer` belongs: the hooks run in the
-    // container's namespaces, and their own paths still resolve on the host.
-    await_init(
-        socket,
-        Kind::Mounted,
-        "waiting for the container's filesystem",
-    )?;
-    if let Some(hooks) = spec.hooks.as_ref() {
-        hooks::run_in_container(pid, &hooks.create_container, &state)?;
-    }
-    sync::send(socket, &Message::new(Kind::HooksRun))?;
-
-    await_init(
-        socket,
-        Kind::Prepared,
-        "waiting for the container to be prepared",
-    )?;
-
-    sync::send(socket, &Message::new(Kind::Proceed))?;
-
-    // A profile with a notify action suspends every matching syscall until an
-    // agent answers, so the descriptor has to reach the agent before the
-    // payload runs. Init sends it back once the filter is installed, which is
-    // the last thing it does before executing.
-    deliver_seccomp_listener(request.plan, &record, socket)?;
-
-    // Applying the process settings is the last thing init does that the
-    // configuration can make fail, and it happens after the handshake above.
-    // Waiting for it here turns a container that could not be built into a
-    // failed `create`, rather than a successful one holding a dead process.
-    await_init(
-        socket,
-        Kind::Configured,
-        "applying the process configuration",
-    )?;
-
-    // A container that is not waiting to be started has no `start` operation
-    // to carry its `startContainer` hooks, so they run here, in the last
-    // moment before the payload replaces init.
-    if !request.awaiting_start {
-        if let Some(hooks) = spec.hooks.as_ref() {
-            hooks::run_in_container(pid, &hooks.start_container, &state)?;
-        }
-    }
-    sync::send(socket, &Message::new(Kind::HooksRun))?;
+    finish_filesystem(request, socket, pid, &state, &where_)?;
+    release_payload(request, socket, pid, &record, &state, &where_)?;
 
     request.store.save(&record, status)?;
 
@@ -576,15 +578,238 @@ pub(crate) fn await_init(
     if message.kind == want {
         return Ok(message);
     }
+    Err(init_failure(&message, doing))
+}
+
+/// Turns a message that is not the one awaited into the error to report.
+fn init_failure(message: &Message, doing: &'static str) -> anyhow::Error {
     if message.kind != Kind::Failed {
-        bail!("{doing}: the container sent an unexpected message");
+        return anyhow::anyhow!(
+            "{doing}: the container sent an unexpected message"
+        );
     }
     let reason = crate::sys::error::strerror(message.errno);
     let context = message.context();
     if context.is_empty() {
-        bail!("{doing}: the container failed: {reason}");
+        return anyhow::anyhow!("{doing}: the container failed: {reason}");
     }
-    bail!("{doing}: {context}: {reason}")
+    anyhow::anyhow!("{doing}: {context}: {reason}")
+}
+
+/// Waits for the container's filesystem and runs the hooks that belong to it.
+///
+/// Init stops once the filesystem exists and before its root changes, which
+/// is where `createContainer` belongs.
+fn finish_filesystem(
+    request: &Request<'_>,
+    socket: BorrowedFd<'_>,
+    pid: i32,
+    state: &str,
+    where_: &hooks::Environment<'_>,
+) -> Result<()> {
+    await_filesystem(request.plan, socket, pid)?;
+    if let Some(hooks) = request.spec.hooks.as_ref() {
+        hooks::run_in_container(
+            pid,
+            &hooks.create_container,
+            state,
+            where_,
+            hooks::Stage::BeforePivot,
+        )?;
+    }
+    sync::send(socket, &Message::new(Kind::HooksRun))?;
+    Ok(())
+}
+
+/// Lets init apply the rest of the plan, and waits for it to say it did.
+fn release_payload(
+    request: &Request<'_>,
+    socket: BorrowedFd<'_>,
+    pid: i32,
+    record: &Record,
+    state: &str,
+    where_: &hooks::Environment<'_>,
+) -> Result<()> {
+    await_init(
+        socket,
+        Kind::Prepared,
+        "waiting for the container to be prepared",
+    )?;
+    sync::send(socket, &Message::new(Kind::Proceed))?;
+
+    // A profile with a notify action suspends every matching syscall until an
+    // agent answers, so the descriptor has to reach the agent before the
+    // payload runs. Init sends it back once the filter is installed, which is
+    // the last thing it does before executing.
+    deliver_seccomp_listener(request.plan, record, socket)?;
+
+    // Applying the process settings is the last thing init does that the
+    // configuration can make fail, and it happens after the handshake above.
+    // Waiting for it here turns a container that could not be built into a
+    // failed `create`, rather than a successful one holding a dead process.
+    await_init(
+        socket,
+        Kind::Configured,
+        "applying the process configuration",
+    )?;
+
+    // A container that is not waiting to be started has no `start` operation
+    // to carry its `startContainer` hooks, so they run here, in the last
+    // moment before the payload replaces init.
+    if !request.awaiting_start {
+        if let Some(hooks) = request.spec.hooks.as_ref() {
+            hooks::run_in_container(
+                pid,
+                &hooks.start_container,
+                state,
+                where_,
+                hooks::Stage::AfterPivot,
+            )?;
+        }
+    }
+    sync::send(socket, &Message::new(Kind::HooksRun))?;
+    Ok(())
+}
+
+/// Waits for the container's filesystem, making the device nodes init cannot.
+///
+/// Creating a character or block device needs privilege in the initial user
+/// namespace, which a container in one of its own does not have. Each
+/// request carries a descriptor for the directory the node belongs in,
+/// resolved by init, so the driver walks no container path of its own.
+fn await_filesystem(
+    plan: &View<'_>,
+    socket: BorrowedFd<'_>,
+    pid: i32,
+) -> Result<()> {
+    const DOING: &str = "waiting for the container's filesystem";
+
+    // One request per device in the plan, which is fixed: a longer sequence
+    // is a protocol error.
+    let limit = plan.count(crate::oci::plan::Section::Devices) as usize;
+    for _ in 0..=limit {
+        let (message, passed) = sync::receive_fd(socket)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context(DOING)?;
+        match message.kind {
+            Kind::Mounted => return Ok(()),
+            Kind::MakeDevice => {
+                let parent = passed.ok_or_else(|| {
+                    anyhow::anyhow!("{DOING}: the request carried no directory")
+                })?;
+                make_device(plan, message.pid, parent.as_fd(), pid)
+                    .context("creating a device node for the container")?;
+                sync::send(socket, &Message::new(Kind::DeviceMade))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            _ => return Err(init_failure(&message, DOING)),
+        }
+    }
+    bail!("{DOING}: the container asked for more devices than it has")
+}
+
+/// Creates the `index`th device of the plan in the directory init resolved.
+fn make_device(
+    plan: &View<'_>,
+    index: i32,
+    parent: BorrowedFd<'_>,
+    pid: i32,
+) -> Result<()> {
+    use rustix::fs::{FileType, Mode, makedev, mknodat};
+
+    let device = nth_device(plan, index)?;
+    let path = plan.raw(device.path)?;
+    let name = crate::sys::path::split_last(path).map_or(path, |(_, n)| n);
+    let name = crate::sys::path::PathBuf::<64>::from(name)?;
+    let kind = match device.kind {
+        b'b' => FileType::BlockDevice,
+        b'c' | b'u' => FileType::CharacterDevice,
+        b'p' => FileType::Fifo,
+        _ => bail!("the device has an unknown type"),
+    };
+
+    // The mode goes on in the call that creates the node: a second step
+    // would act on a name, and a name can be made to mean something else.
+    // The file creation mask is cleared so the mode arrives whole.
+    let mode = {
+        let _mask = crate::linux::rootfs::NoUmask::enter();
+        mknodat(
+            parent,
+            name.as_c_str(),
+            kind,
+            Mode::from_raw_mode(device.mode),
+            makedev(device.major, device.minor),
+        )
+    };
+    mode.with_context(|| {
+        format!("creating {}", String::from_utf8_lossy(path))
+    })?;
+
+    // The configuration names the owner in the container's id space, and this
+    // process writes in the host's.
+    let uid = map_id("uid_map", pid, device.uid)?;
+    let gid = map_id("gid_map", pid, device.gid)?;
+    rustix::fs::chownat(
+        parent,
+        name.as_c_str(),
+        Some(rustix::fs::Uid::from_raw(uid)),
+        Some(rustix::fs::Gid::from_raw(gid)),
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .context("setting the ownership")
+}
+
+/// Reads one device out of the plan by position.
+fn nth_device(
+    plan: &View<'_>,
+    index: i32,
+) -> Result<crate::oci::plan::record::DeviceOp> {
+    let wanted =
+        usize::try_from(index).context("the device index is not one")?;
+    let mut at = 0usize;
+    let mut found = None;
+    plan.devices(|device| {
+        if at == wanted {
+            found = Some(device);
+        }
+        at += 1;
+        Ok(())
+    })
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    found.context("the plan has no device at that position")
+}
+
+/// Translates an id from the container's space into the host's.
+///
+/// The kernel's own mapping is read rather than the configuration's: a
+/// container that joined somebody else's user namespace has one the plan
+/// knows nothing about, and one in no user namespace has the identity map.
+fn map_id(file: &str, pid: i32, id: u32) -> Result<u32> {
+    let path = format!("/proc/{pid}/{file}");
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {path}"))?;
+    for line in text.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let (Some(container), Some(host), Some(size)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (Ok(container), Ok(host), Ok(size)) = (
+            container.parse::<u32>(),
+            host.parse::<u32>(),
+            size.parse::<u32>(),
+        ) else {
+            continue;
+        };
+        let offset = id.wrapping_sub(container);
+        if id >= container && offset < size {
+            return host
+                .checked_add(offset)
+                .context("the mapping runs past the end of the id space");
+        }
+    }
+    bail!("the id {id} is outside the container's {file}")
 }
 
 /// Decides where the container's terminal goes, if it asks for one.
@@ -645,7 +870,7 @@ fn settle_cgroup(
         release_cgroupns(lowered, socket)?;
     } else {
         manager
-            .add_process(pid)
+            .add_process(payload_process(pid))
             .context("moving the container into its cgroup")?;
     }
     manager
@@ -819,6 +1044,33 @@ pub(crate) fn apply_affinity(list: Option<&str>, pid: i32) -> Result<()> {
     let set = crate::sys::process::CpuSet::parse(list)?;
     crate::sys::process::set_affinity(pid, &set)?;
     Ok(())
+}
+
+/// The process a setting applied from outside has to name.
+///
+/// An init that creates or joins a pid namespace forks and stays behind as a
+/// proxy, and the proxy's child is already running: a cgroup the proxy is
+/// moved into, or an affinity it is given, is not inherited. The proxy has
+/// exactly one child, which the kernel names here.
+pub(crate) fn payload_process(pid: i32) -> i32 {
+    let path = format!("/proc/{pid}/task/{pid}/children");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        // Without the file there is no way to tell a proxy from the
+        // process itself. The clone's own answer is right whenever init
+        // did not fork, and silently wrong when it did.
+        Err(error) => {
+            crate::log::warn(&format!(
+                "cannot read {path} ({error}), so a setting meant for the \
+                 container's process may land on the process that forked it"
+            ));
+            return pid;
+        }
+    };
+    text.split_ascii_whitespace()
+        .next()
+        .and_then(|first| first.parse().ok())
+        .unwrap_or(pid)
 }
 
 /// Puts the container in the cache and bandwidth class it asked for.

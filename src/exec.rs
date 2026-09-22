@@ -148,12 +148,20 @@ fn apply_overrides<'a>(
     if let Some(cwd) = options.cwd.as_deref() {
         process.cwd = arena.alloc_str(cwd);
     }
+    // A variable named on the command line replaces the container's own:
+    // with two entries under one name the program reads the first, which
+    // is the container's, and the caller's would do nothing.
     for entry in &options.env {
+        let name = entry.split('=').next().unwrap_or(entry);
+        process.env.retain(|existing| {
+            existing.split('=').next().unwrap_or(existing) != name
+        });
         process.env.push(arena.alloc_str(entry));
     }
-    if options.no_new_privs {
-        process.no_new_privileges = true;
-    }
+    // An `exec` process is described by what the caller asked for, not by
+    // what the payload was given. Inheriting this one would leave no way
+    // to ask for the other answer.
+    process.no_new_privileges = options.no_new_privs;
     if let Some(profile) = options.apparmor.as_deref() {
         process.apparmor_profile = Some(arena.alloc_str(profile));
     }
@@ -322,10 +330,15 @@ fn supervise(
         "waiting for the process to be prepared",
     )?;
 
+    // Everything below names the process that will run the caller's
+    // program, which is not the one the clone returned when init had to
+    // fork into the container's pid namespace.
+    let payload = driver::payload_process(pid);
+
     // The affinity the process starts under, before it is placed: the
     // specification states these two separately because placement itself
     // can change what a process may run on, through a cpuset.
-    driver::apply_affinity(affinity.initial.as_deref(), pid)
+    driver::apply_affinity(affinity.initial.as_deref(), payload)
         .context("applying the initial CPU affinity")?;
 
     // Only a process the clone could not place needs moving. The only way to
@@ -333,13 +346,13 @@ fn supervise(
     if !in_cgroup {
         let sub = options.cgroup.as_deref().unwrap_or_default();
         manager
-            .add_process_in(pid, sub)
+            .add_process_in(payload, sub)
             .context("placing the process in the container's cgroup")?;
     }
 
     // And the affinity it runs the caller's program under, which the
     // program inherits through `execve`.
-    driver::apply_affinity(affinity.final_set.as_deref(), pid)
+    driver::apply_affinity(affinity.final_set.as_deref(), payload)
         .context("applying the CPU affinity for the process")?;
 
     sync::send(socket.as_fd(), &Message::new(Kind::Proceed))?;

@@ -64,7 +64,126 @@ pub fn spec(spec: &Spec<'_>) -> Result<()> {
     check_unimplemented(linux)?;
     check_id_maps(linux)?;
     check_seccomp(linux)?;
+    check_sysctls(spec, linux)?;
     Ok(())
+}
+
+/// Refuses a parameter the container would set on the host, or set twice.
+///
+/// A kernel parameter belongs to a namespace, so writing one from a
+/// container that shares that namespace with the host changes the host's,
+/// and the write succeeds while it does it.
+///
+/// The container's name is the other half: it has a field of its own, and a
+/// configuration that also names it as a parameter, differently, asks for
+/// two things at once with no order between them.
+fn check_sysctls(spec: &Spec<'_>, linux: &spec::Linux<'_>) -> Result<()> {
+    if linux.sysctl.is_empty() {
+        return Ok(());
+    }
+    let creates = |kind: &str| {
+        linux
+            .namespaces
+            .iter()
+            .any(|n| n.kind == kind && n.path.is_none())
+    };
+    // A namespace the configuration joins is somebody else's, and its
+    // parameters are that owner's business. One this runtime is already in
+    // is not somebody else's: it is the host's, reached the long way round.
+    let joins_another = |kind: &str| {
+        linux.namespaces.iter().any(|n| {
+            n.kind == kind
+                && n.path.is_some_and(|path| !is_our_namespace(kind, path))
+        })
+    };
+    let own = |kind: &str| creates(kind) || joins_another(kind);
+
+    for &(key, value) in &linux.sysctl {
+        ensure!(
+            key != "kernel.hostname",
+            "linux.sysctl names kernel.hostname; the container's name is \
+             the `hostname` field, and this parameter would rename the \
+             whole UTS namespace it is set in"
+        );
+        // Both spellings may name the same domain: the outcome is the one
+        // the configuration describes either way. Two different names
+        // leave the result to whichever is applied last.
+        if key == "kernel.domainname" {
+            let named = spec.domainname.unwrap_or_default();
+            ensure!(
+                named.is_empty() || named == value,
+                "config.json sets the domain name to `{named}` and the \
+                 linux.sysctl kernel.domainname to `{value}`"
+            );
+        }
+        if let Some(kind) = namespace_of(key) {
+            ensure!(
+                own(kind),
+                "linux.sysctl names {key}, which belongs to the {kind} \
+                 namespace; this container shares the host's, so setting \
+                 it would change the host"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether `path` names the namespace this runtime is already in.
+///
+/// Two paths naming one namespace share a device and inode. A path that
+/// cannot be looked at is treated as somebody else's, since the join itself
+/// fails later with a better answer than a refusal here would give.
+fn is_our_namespace(kind: &str, path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    // The specification's names for two of these are not the kernel's.
+    let file = match kind {
+        "network" => "net",
+        "mount" => "mnt",
+        other => other,
+    };
+    let (Ok(theirs), Ok(ours)) = (
+        std::fs::metadata(path),
+        std::fs::metadata(format!("/proc/self/ns/{file}")),
+    ) else {
+        return false;
+    };
+    (theirs.dev(), theirs.ino()) == (ours.dev(), ours.ino())
+}
+
+/// The namespace a kernel parameter belongs to, when it belongs to one.
+///
+/// These are the parameters the kernel keeps per namespace. Anything else is
+/// the machine's, and writing one is refused for a different reason: it is
+/// not the container's to set at all, which the read-only `/proc/sys` a
+/// stock bundle asks for already prevents.
+fn namespace_of(key: &str) -> Option<&'static str> {
+    const IPC: [&str; 13] = [
+        "kernel.msgmax",
+        "kernel.msgmnb",
+        "kernel.msgmni",
+        "kernel.sem",
+        "kernel.shmall",
+        "kernel.shmmax",
+        "kernel.shmmni",
+        "kernel.shm_rmid_forced",
+        "kernel.mq_msg_default",
+        "kernel.mq_msgsize_default",
+        "kernel.msg_next_id",
+        "kernel.sem_next_id",
+        "kernel.shm_next_id",
+    ];
+
+    if key.starts_with("net.") {
+        return Some("network");
+    }
+    if key.starts_with("fs.mqueue.") || IPC.contains(&key) {
+        return Some("ipc");
+    }
+    if key == "kernel.domainname" {
+        return Some("uts");
+    }
+    None
 }
 
 /// Refuses a filter that asks for a supervisor it does not name.
@@ -112,9 +231,15 @@ fn check_process(process: &spec::Process<'_>) -> Result<()> {
         "process.cwd {} must be an absolute path",
         process.cwd
     );
+    // Only the first entry has to say something: it names the program, and
+    // an empty name cannot be resolved. The rest are the program's own
+    // arguments, and an empty one is a value like any other.
     ensure!(
-        !process.args.iter().any(|argument| argument.is_empty()),
-        "process.args must not contain an empty entry"
+        process
+            .args
+            .first()
+            .is_none_or(|program| !program.is_empty()),
+        "process.args[0] names the program to run and must not be empty"
     );
 
     // Two limits of the same kind describe the same file, and the one that
@@ -128,6 +253,51 @@ fn check_process(process: &spec::Process<'_>) -> Result<()> {
         );
         seen.push(limit.kind);
     }
+    if let Some(scheduler) = process.scheduler.as_ref() {
+        check_deadline(scheduler)?;
+    }
+    Ok(())
+}
+
+/// Checks the three figures the deadline policy is described by.
+///
+/// The kernel answers an inconsistent set with `EINVAL`, from a call made
+/// inside the container after everything else has been built. The rules are
+/// simple enough to state here, where the answer can name the field.
+fn check_deadline(scheduler: &spec::Scheduler<'_>) -> Result<()> {
+    if !scheduler.policy.eq_ignore_ascii_case("SCHED_DEADLINE") {
+        return Ok(());
+    }
+    ensure!(
+        scheduler.runtime > 0,
+        "process.scheduler: SCHED_DEADLINE needs a runtime above zero"
+    );
+    ensure!(
+        scheduler.deadline > 0,
+        "process.scheduler: SCHED_DEADLINE needs a deadline above zero"
+    );
+    // A period of zero means the deadline is the period, which is the
+    // kernel's own default and a configuration this accepts.
+    let period = if scheduler.period == 0 {
+        scheduler.deadline
+    } else {
+        scheduler.period
+    };
+    ensure!(
+        scheduler.runtime <= scheduler.deadline,
+        "process.scheduler: the SCHED_DEADLINE runtime {} is longer than \
+         its deadline {}, so the task could never finish in time",
+        scheduler.runtime,
+        scheduler.deadline
+    );
+    ensure!(
+        scheduler.deadline <= period,
+        "process.scheduler: the SCHED_DEADLINE deadline {} is longer than \
+         its period {}, so one instance would still be due when the next \
+         begins",
+        scheduler.deadline,
+        period
+    );
     Ok(())
 }
 

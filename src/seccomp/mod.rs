@@ -61,7 +61,13 @@ impl Action {
     /// OCI configuration provides it in a separate field.
     #[must_use]
     pub fn by_name(name: &str, errno: Option<u16>) -> Option<Self> {
-        let bare = name.strip_prefix("SCMP_ACT_").unwrap_or(name);
+        // The prefix is part of the name the specification defines. A
+        // profile that says `ALLOW` was written against something else,
+        // and a security policy is not worth guessing at.
+        let bare = name
+            .get(..9)
+            .filter(|p| p.eq_ignore_ascii_case("SCMP_ACT_"))?;
+        let bare = name.get(bare.len()..)?;
         match bare.to_ascii_uppercase().as_str() {
             "KILL_PROCESS" => Some(Self::KillProcess),
             "KILL" | "KILL_THREAD" => Some(Self::KillThread),
@@ -118,7 +124,11 @@ impl Op {
     /// Resolves an `SCMP_CMP_*` token.
     #[must_use]
     pub fn by_name(name: &str) -> Option<Self> {
-        let bare = name.strip_prefix("SCMP_CMP_").unwrap_or(name);
+        // As with an action, the prefix is part of the name.
+        let bare = name
+            .get(..9)
+            .filter(|p| p.eq_ignore_ascii_case("SCMP_CMP_"))?;
+        let bare = name.get(bare.len()..)?;
         match bare.to_ascii_uppercase().as_str() {
             "NE" => Some(Self::NotEqual),
             "LT" => Some(Self::LessThan),

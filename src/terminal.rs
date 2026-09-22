@@ -129,7 +129,10 @@ impl Drop for RawMode {
 ///
 /// Returns once the terminal reports end of file, which happens when the last
 /// process holding the container end closes it.
-pub fn relay(terminal: BorrowedFd<'_>) -> Result<()> {
+pub fn relay(
+    terminal: BorrowedFd<'_>,
+    forwarding: Option<&crate::signals::Forwarding>,
+) -> Result<()> {
     use rustix::event::{PollFd, PollFlags, poll};
 
     let stdin = rustix::stdio::stdin();
@@ -143,20 +146,42 @@ pub fn relay(terminal: BorrowedFd<'_>) -> Result<()> {
     // long-lived interactive session is unaffected and still stops a runaway.
     for _ in 0..u32::MAX {
         // Built on the stack each turn, so the loop does not allocate and
-        // no result from the previous turn can be read as this turn's.
+        // no result from the previous turn can be read as this turn's. An
+        // entry that is not being watched is polled for nothing rather
+        // than left out, so each index means one thing throughout.
+        let signals = forwarding.map(super::signals::Forwarding::fd);
+        let nothing = PollFlags::empty();
+        let watch = |wanted: bool| if wanted { PollFlags::IN } else { nothing };
         let mut fds = [
             PollFd::new(&terminal, PollFlags::IN),
-            PollFd::new(&stdin, PollFlags::IN),
+            PollFd::new(&stdin, watch(input_open)),
+            PollFd::new(
+                signals.as_ref().unwrap_or(&terminal),
+                watch(signals.is_some()),
+            ),
         ];
-        let watched = if input_open { 2 } else { 1 };
-        let polled = fds.get_mut(..watched).unwrap_or_default();
-        poll(polled, None).context("waiting on the terminal")?;
+        poll(&mut fds, None).context("waiting on the terminal")?;
+
+        // A signal for the container arrived while this was waiting. A
+        // window change is the one the runtime answers itself: the container
+        // sees the new size through the terminal rather than through the
+        // signal.
+        let signalled = signals.is_some()
+            && fds.get(2).is_some_and(|fd| !fd.revents().is_empty());
+        if signalled {
+            if let Some(forwarding) = forwarding {
+                if forwarding.deliver().map_err(|e| anyhow::anyhow!("{e}"))? {
+                    inherit_size(terminal, stdin);
+                }
+            }
+        }
 
         let terminal_ready =
             fds.first().is_some_and(|fd| !fd.revents().is_empty());
-        let input_ready = fds
-            .get(1)
-            .is_some_and(|fd| fd.revents().contains(PollFlags::IN));
+        let input_ready = input_open
+            && fds
+                .get(1)
+                .is_some_and(|fd| fd.revents().contains(PollFlags::IN));
 
         if terminal_ready {
             match rustix::io::read(terminal, &mut buffer) {

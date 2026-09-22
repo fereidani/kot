@@ -188,17 +188,50 @@ pub fn enter_working_directory(
             ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS,
         )
     };
-    let directory = match open() {
-        Ok(fd) => fd,
+    let directory =
+        open().context("process: chdir to the working directory")?;
+    fchdir(directory.as_fd()).context("process: chdir")
+}
+
+/// Puts this process in a process group of its own.
+///
+/// A process group is named by a process id, and the group inherited from
+/// outside a pid namespace has no name inside it: `getpgrp` answers zero and
+/// nothing can signal the group. Starting one here gives it a name.
+///
+/// Not for a process that goes on to lead a session: `setsid` refuses a
+/// process that already leads a group, and makes a group of its own anyway.
+pub fn start_process_group() -> Result<()> {
+    rustix::process::setpgid(None, None)
+        .context("process: start a process group")
+}
+
+/// Creates the working directory when the image does not ship it.
+///
+/// Separate from entering it, and earlier, because it writes to the
+/// container's filesystem: by the time the payload's settings are applied
+/// the root may already be read only.
+pub fn create_working_directory(
+    plan: &View<'_>,
+    process: &Process,
+) -> Result<()> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+
+    let cwd = plan.c_str(process.cwd)?;
+    let found = openat2(
+        rustix::fs::CWD,
+        cwd,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS,
+    );
+    match found {
+        Ok(_) => Ok(()),
         Err(e) if e.raw_os_error() == crate::sys::error::ENOENT => {
-            create_directories(plan.raw(process.cwd)?)?;
-            open().context("process: open working directory")?
+            create_directories(plan.raw(process.cwd)?)
         }
-        Err(e) => {
-            return Err(Error::from(e).describe("process: working directory"));
-        }
-    };
-    fchdir(directory.as_fd()).context("process: enter working directory")
+        Err(e) => Err(Error::from(e).describe("process: working directory")),
+    }
 }
 
 /// Creates every missing component of a path inside the container.
@@ -217,6 +250,49 @@ fn create_directories(path: &[u8]) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Gives the container's user the streams it was handed.
+///
+/// The payload inherits its streams from whoever started the runtime and
+/// runs as whatever user the configuration names. Those are usually
+/// different users, and a stream the payload cannot write to is a container
+/// that looks like it produced nothing.
+///
+/// Devices are left alone: they are shared with the whole machine, and a
+/// terminal the container gets is made for it with the right owner already.
+/// A refusal is not an error, since the stream may belong to a user this
+/// runtime cannot give away.
+pub fn adopt_standard_streams(process: &Process) {
+    use rustix::fs::{FileType, Gid, Uid, fchown, fstat};
+
+    /// The mode bit that says anyone may write to the file.
+    const OTHER_WRITE: u32 = 0o002;
+
+    for number in 0..=2 {
+        // SAFETY: the three standard descriptors are open for the life of
+        // the process, and the borrow does not outlive this turn.
+        let stream = unsafe { BorrowedFd::borrow_raw(number) };
+        let Ok(stat) = fstat(stream) else { continue };
+        let kind = FileType::from_raw_mode(stat.st_mode);
+        if matches!(kind, FileType::CharacterDevice | FileType::BlockDevice) {
+            continue;
+        }
+        if stat.st_uid == process.uid && stat.st_gid == process.gid {
+            continue;
+        }
+        // A stream anyone may already write to needs no handing over, and
+        // leaving it alone spares a host file an ownership change that
+        // would have bought the container nothing.
+        if stat.st_mode & OTHER_WRITE != 0 {
+            continue;
+        }
+        let _ = fchown(
+            stream,
+            Some(Uid::from_raw(process.uid)),
+            Some(Gid::from_raw(process.gid)),
+        );
+    }
 }
 
 /// Drops to the container's user and group.
@@ -415,6 +491,9 @@ pub fn apply_no_new_privs(process: &Process) -> Result<()> {
 pub struct Command {
     argv: Vec<*const u8>,
     envp: Vec<*const u8>,
+    /// Variables the runtime adds, kept alive for as long as `envp` points
+    /// into them.
+    added: Vec<std::ffi::CString>,
 }
 
 impl Command {
@@ -430,7 +509,67 @@ impl Command {
         if argv.len() < 2 {
             return Err(Error::msg("process: args is empty"));
         }
-        Ok(Self { argv, envp })
+        Ok(Self {
+            argv,
+            envp,
+            added: Vec::new(),
+        })
+    }
+
+    /// Adds a variable the configuration did not set.
+    ///
+    /// The string is owned here, because unlike the rest of the environment
+    /// it is not in the plan.
+    fn add(&mut self, name: &str, value: &[u8]) -> Result<()> {
+        let mut entry = Vec::with_capacity(name.len() + value.len() + 2);
+        entry.extend_from_slice(name.as_bytes());
+        entry.push(b'=');
+        entry.extend_from_slice(value);
+        let entry = std::ffi::CString::new(entry)
+            .map_err(|_| Error::msg("process: the value has a nul in it"))?;
+        let pointer = entry.as_ptr().cast::<u8>();
+        self.added.push(entry);
+        // The list ends with a null, and the new entry goes before it.
+        let last = self.envp.len().saturating_sub(1);
+        self.envp.insert(last, pointer);
+        Ok(())
+    }
+
+    /// Gives the payload a home directory when the configuration named none.
+    ///
+    /// A program that finds no home writes wherever it falls back to, which
+    /// for a shell is the working directory. The container's own passwd
+    /// file decides, and the root directory is the answer when it says
+    /// nothing about this user.
+    ///
+    /// Runs after the root has changed, so the file read is the container's.
+    pub fn ensure_home(&mut self, uid: u32) -> Result<()> {
+        if self.env("HOME").is_some() {
+            return Ok(());
+        }
+        let mut passwd = Vec::new();
+        let path = std::path::Path::new("/etc/passwd");
+        let home = match crate::file::read_capped(path, PASSWD_MAX, &mut passwd)
+        {
+            Ok(()) => home_of(&passwd, uid).unwrap_or(b"/").to_vec(),
+            Err(_) => b"/".to_vec(),
+        };
+        self.add("HOME", &home)
+    }
+
+    /// Tells the payload which process the sockets it was handed belong to.
+    ///
+    /// A service manager sets `LISTEN_FDS` and leaves `LISTEN_PID` to
+    /// whoever starts the process, since only it knows the number. Inside a
+    /// pid namespace that number is one, and a payload comparing its own id
+    /// with the runtime's would ignore the sockets it was given.
+    pub fn set_listen_pid(&mut self, pid: i32) -> Result<()> {
+        if self.env("LISTEN_FDS").is_none() {
+            return Ok(());
+        }
+        let mut text = crate::sys::path::Path::new();
+        text.push_u64(u64::try_from(pid).unwrap_or(0))?;
+        self.add("LISTEN_PID", text.as_bytes())
     }
 
     /// Collects one string section as the pointers `execve` takes.
@@ -493,6 +632,42 @@ impl Command {
     }
 }
 
+/// Most of a passwd file this reads looking for a home directory. A file
+/// larger than this is not one a container's own accounts fill.
+const PASSWD_MAX: usize = 1 << 20;
+
+/// The home directory a passwd file gives `uid`.
+///
+/// Seven colon separated fields per line, the third the user id and the
+/// sixth the home directory. A shorter line is skipped: the file belongs to
+/// the image, and one malformed account is no reason to refuse to start.
+fn home_of(passwd: &[u8], uid: u32) -> Option<&[u8]> {
+    for line in passwd.split(|&b| b == b'\n') {
+        let mut fields = line.split(|&b| b == b':');
+        let (Some(_name), Some(_password), Some(id)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let matches = core::str::from_utf8(id)
+            .ok()
+            .and_then(|text| text.parse::<u32>().ok())
+            == Some(uid);
+        if !matches {
+            continue;
+        }
+        let (Some(_gid), Some(_comment), Some(home)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if !home.is_empty() {
+            return Some(home);
+        }
+    }
+    None
+}
+
 /// Resolves the payload inside the container.
 ///
 /// A name with no separator is looked up along `PATH`, which the specification
@@ -510,10 +685,27 @@ pub fn resolve_program(command: &Command) -> Result<OwnedFd> {
         return Err(Error::msg("process: args[0] is empty"));
     }
 
+    // `RESOLVE_IN_ROOT` makes the directory it resolves from the root of
+    // the resolution, so an absolute path has to start at the container's
+    // root: otherwise `/init` would mean `/init` under `process.cwd`.
+    let root = rustix::fs::open(
+        c"/",
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .context("process: open the container root")?;
+
     let open = |path: &core::ffi::CStr| {
+        let (at, path) = match path.to_bytes().strip_prefix(b"/") {
+            // Every component past the first separator, which the root
+            // descriptor now stands for. A path of just separators names the
+            // root itself, which is not a program.
+            Some(rest) => (root.as_fd(), Path::from(rest)?),
+            None => (rustix::fs::CWD, Path::from(path.to_bytes())?),
+        };
         openat2(
-            rustix::fs::CWD,
-            path,
+            at,
+            path.as_c_str(),
             OFlags::PATH | OFlags::CLOEXEC,
             Mode::empty(),
             // Confinement and the refusal to follow a magic link are both the
@@ -521,6 +713,7 @@ pub fn resolve_program(command: &Command) -> Result<OwnedFd> {
             // to `/proc/self/exe` from resolving to the runtime.
             ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS,
         )
+        .map_err(Error::from)
     };
 
     if bytes.contains(&b'/') {

@@ -31,6 +31,7 @@ pub mod pty;
 pub mod raw;
 pub mod seccomp;
 pub mod signal;
+pub mod signalfd;
 
 pub use error::{Context, Error, Result};
 pub use path::{Path, PathBuf};

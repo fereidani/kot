@@ -56,9 +56,14 @@ fn connect(path: &str) -> Result<OwnedFd> {
 /// `fds` names the descriptors in the order they are attached, which is how
 /// the agent knows which one is the listener.
 fn payload(metadata: &str, record: &Record) -> String {
+    /// The version of the protocol spoken to a seccomp agent, not the
+    /// container's: an agent reads this to know how to read the rest of the
+    /// document. The container's version is in the state object below.
+    const PROTOCOL_VERSION: &str = "0.2.0";
+
     let mut json = crate::json::Writer::new();
     json.object(None);
-    json.string(Some("ociVersion"), &record.oci_version);
+    json.string(Some("ociVersion"), PROTOCOL_VERSION);
     json.string_array("fds", ["seccompFd"]);
     json.number(Some("pid"), i64::from(record.pid));
     json.string(Some("metadata"), metadata);
@@ -66,9 +71,12 @@ fn payload(metadata: &str, record: &Record) -> String {
     // agent reads the whole payload into the structure the specification
     // defines, and a string where an object belongs fails that outright,
     // leaving every syscall the profile hands over suspended.
+    // The container is being created: the filter is installed and the
+    // payload has not run. What the process looks like from outside would
+    // say `running`, of a container that has not started.
     json.document(
         Some("state"),
-        &crate::state::render_public(record, crate::state::observe(record)),
+        &crate::state::render_public(record, crate::state::Status::Creating),
     );
     json.end_object();
     json.finish()

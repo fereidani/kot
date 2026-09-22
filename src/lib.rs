@@ -29,6 +29,7 @@ pub mod log;
 pub mod rdt;
 pub mod report;
 mod seccomp_agent;
+mod signals;
 mod state;
 pub mod stats;
 mod template;
@@ -78,7 +79,7 @@ pub fn failure_code(argv: &[String]) -> i32 {
 /// Returns whatever the command failed with, for the entry point to report.
 pub fn run(argv: &[String]) -> Result<i32> {
     let (global, command) = cli::parse(argv)?;
-    log::configure(&global);
+    log::configure(&global)?;
 
     // The init subcommand is the runtime re-entering itself from a sealed
     // image. It never returns on success, and it reports failures back to the

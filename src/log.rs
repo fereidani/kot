@@ -23,7 +23,13 @@ static LEVEL: AtomicU8 = AtomicU8::new(0);
 static JSON: AtomicU8 = AtomicU8::new(0);
 
 /// Points the log at wherever the caller asked for.
-pub fn configure(global: &Global) {
+///
+/// # Errors
+///
+/// When the target names something this runtime cannot write to. A caller
+/// that asked for the diagnostics to go somewhere and silently got them
+/// elsewhere has no way to find that out.
+pub fn configure(global: &Global) -> anyhow::Result<()> {
     LEVEL.store(
         match global.level {
             Level::Error => 0,
@@ -37,17 +43,37 @@ pub fn configure(global: &Global) {
         Ordering::Relaxed,
     );
 
-    let file = global.log.as_deref().and_then(|target| {
-        // Other runtimes accept a `file:` prefix; a bare path means the same
-        // thing.
-        let path = target.strip_prefix("file:").unwrap_or(target);
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()
-    });
+    let file = match global.log.as_deref() {
+        None => None,
+        Some(target) => Some(open_target(target)?),
+    };
     let _ = SINK.set(Mutex::new(file));
+    Ok(())
+}
+
+/// Opens what `--log` names, which is a path or a path behind a scheme.
+///
+/// Only one scheme is spoken: a file. Taking the whole string as a name
+/// instead would quietly make a file called `journald:` in the current
+/// directory.
+fn open_target(target: &str) -> anyhow::Result<File> {
+    let path = match target.split_once(':') {
+        Some(("file", rest)) => rest,
+        // A colon inside a file name is not a scheme; only one before the
+        // first separator can be.
+        Some((scheme, _)) if !scheme.is_empty() && !scheme.contains('/') => {
+            anyhow::bail!(
+                "--log names the {scheme} scheme, which this runtime does \
+                 not write to; use a path or file:PATH"
+            );
+        }
+        _ => target,
+    };
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("opening the log file {path}: {e}"))
 }
 
 /// Reports a failure.

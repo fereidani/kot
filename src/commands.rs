@@ -45,6 +45,10 @@ pub fn dispatch(
             print!("{}", crate::cli::USAGE);
             Ok(0)
         }
+        Command::CommandHelp(usage) => {
+            print!("{usage}");
+            Ok(0)
+        }
         Command::Init { .. } => bail!("__init is not callable directly"),
     }
 }
@@ -68,17 +72,25 @@ fn run(global: &Global, store: &Store, options: &Start) -> Result<i32> {
         return Ok(0);
     }
 
+    // A signal sent to a runtime running a container in the foreground is
+    // meant for the container, so until the container is gone they are
+    // taken off this process and passed on.
+    let forwarding = crate::signals::Forwarding::install(created.pid)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("forwarding signals to the container")?;
+
     // When the runtime is holding the container's terminal it has to keep
     // copying until the container is done, and it has to put the caller's
     // terminal back however that ends.
     let status = match created.terminal.take() {
         Some(terminal) => {
             let _raw = crate::terminal::RawMode::enter()?;
-            crate::terminal::relay(terminal.as_fd())?;
-            crate::wait_for_process(created.pid)?
+            crate::terminal::relay(terminal.as_fd(), Some(&forwarding))?;
+            crate::signals::wait(created.pid, &forwarding)?
         }
-        None => crate::wait_for_process(created.pid)?,
+        None => crate::signals::wait(created.pid, &forwarding)?,
     };
+    drop(forwarding);
     let _ = created.manager.destroy();
     // `--keep` leaves the state behind so the caller can still ask what the
     // container did after it has finished. Without it the record goes with
@@ -538,7 +550,15 @@ fn start_container_hooks(record: &Record) -> Result<()> {
         return Ok(());
     }
     let state = state::render_public(record, crate::observed_status(record));
-    hooks::run_in_container(record.pid, &sections.start_container, &state)
+    let bundle = std::path::Path::new(&record.bundle);
+    let where_ = hooks::Environment::new(bundle, &spec.annotations);
+    hooks::run_in_container(
+        record.pid,
+        &sections.start_container,
+        &state,
+        &where_,
+        hooks::Stage::AfterPivot,
+    )
 }
 
 /// Reads the bundle back and runs one of its hook lists.
@@ -575,7 +595,13 @@ fn run_bundle_hooks(record: &Record, point: HookPoint) {
         HookPoint::PostStop => &sections.poststop,
     };
     let state = state::render_public(record, crate::observed_status(record));
-    hooks::run_best_effort(list, &state);
+    let bundle = std::path::Path::new(&record.bundle);
+    let where_ = hooks::Environment::new(bundle, &spec.annotations);
+    let name = match point {
+        HookPoint::PostStart => "poststart",
+        HookPoint::PostStop => "poststop",
+    };
+    hooks::run_best_effort(list, &state, &where_, name);
 }
 
 /// Reports what a container is using.

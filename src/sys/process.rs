@@ -40,12 +40,16 @@ pub fn setns(fd: BorrowedFd<'_>, nstype: u64) -> Result<()> {
 pub fn join_before_exec(
     command: &mut std::process::Command,
     namespaces: Vec<OwnedFd>,
+    directory: Option<std::ffi::CString>,
+    enters_pid_namespace: bool,
 ) {
     use std::os::unix::process::CommandExt as _;
 
     // SAFETY: the closure runs in the forked child, which has one thread,
-    // between the fork and `execve`. It calls `setns` and nothing else: no
-    // allocation, no lock, and no descriptor it was not already handed.
+    // between the fork and `execve`. Everything it calls is
+    // async-signal-safe and allocates nothing: `setns`, `chdir`, and, for a
+    // pid namespace, a further `clone`, `waitpid` and `exit_group`. It
+    // touches no descriptor it was not already handed.
     unsafe {
         command.pre_exec(move || {
             for fd in &namespaces {
@@ -53,9 +57,107 @@ pub fn join_before_exec(
                     std::io::Error::from_raw_os_error(error.errno())
                 })?;
             }
+            // After the joins, not before: a working directory set before
+            // them names a directory in the namespace left behind, and the
+            // program would come up somewhere with no path at all.
+            if let Some(directory) = directory.as_deref() {
+                rustix::process::chdir(directory).map_err(|error| {
+                    std::io::Error::from_raw_os_error(error.raw_os_error())
+                })?;
+            }
+            // `setns` puts a process's children in a pid namespace, never
+            // the process itself, so without one more fork the program
+            // would run beside the container on the host's process
+            // numbers. This process stays behind as a proxy for it.
+            if enters_pid_namespace {
+                enter_pid_namespace()?;
+            }
             Ok(())
         });
     }
+}
+
+/// What a proxy that goes away takes its child down with.
+const SIGKILL_NUMBER: i32 = 9;
+
+/// Forks so that the caller's program is inside the pid namespace already
+/// joined, and turns the caller into a proxy for it.
+///
+/// Returns only in the child. The proxy waits and exits with what the child
+/// did, without unwinding: it is a forked copy of a process that was about
+/// to execute something else, and none of that state is its to undo.
+fn enter_pid_namespace() -> std::io::Result<()> {
+    use crate::sys::clone::{CloneSpec, Fork};
+
+    // SAFETY: this runs between a fork and an execution, in a process with
+    // one thread, and the child only ever returns to the caller's execution.
+    let side = unsafe { CloneSpec::new().spawn() }
+        .map_err(|error| std::io::Error::from_raw_os_error(error.errno()))?;
+    let pid = match side {
+        Fork::Child => {
+            // The runtime holds the proxy, and kills it when a hook
+            // outstays its timeout. Without this the hook would survive
+            // that, reparented onto the container's init.
+            crate::sys::prctl::set_pdeathsig(SIGKILL_NUMBER).map_err(
+                |error| std::io::Error::from_raw_os_error(error.errno()),
+            )?;
+            return Ok(());
+        }
+        Fork::Parent(pid) => pid,
+    };
+    // One of the inherited descriptors decides whether the caller ever gets
+    // its child back: the standard library learns that an execution
+    // succeeded when the socket it handed the child closes, which takes
+    // every copy. The copy that means anything is the one held by the
+    // process that executes, so this one goes. Nothing below needs a
+    // descriptor.
+    let _ = close_range(3, u32::MAX, 0);
+    let status = wait_for_child(pid);
+    exit_group(status)
+}
+
+/// Ends this process and every thread in it, without unwinding anything.
+#[allow(clippy::cast_sign_loss)]
+fn exit_group(status: i32) -> ! {
+    // Bounded: the kernel does not return from this, and the loop is only
+    // there because the compiler cannot know that.
+    loop {
+        // SAFETY: the single argument is a scalar, and the call does not
+        // return.
+        unsafe {
+            let _ = syscall1(nr::EXIT_GROUP, status as usize);
+        }
+    }
+}
+
+/// Waits for one child and renders its end as an exit status.
+fn wait_for_child(pid: i32) -> i32 {
+    use rustix::process::{Pid, WaitOptions, waitpid};
+
+    /// What a shell reports for a program a signal ended.
+    const SIGNALLED: i32 = 128;
+
+    let Some(pid) = Pid::from_raw(pid) else {
+        return 1;
+    };
+    // Bounded: only an interrupted wait repeats.
+    for _ in 0..1024 {
+        match waitpid(Some(pid), WaitOptions::empty()) {
+            Ok(Some((_, status))) => {
+                if let Some(code) = status.exit_status() {
+                    return code;
+                }
+                if let Some(signal) = status.terminating_signal() {
+                    return SIGNALLED + signal;
+                }
+                return 1;
+            }
+            Ok(None) => {}
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(_) => return 1,
+        }
+    }
+    1
 }
 
 /// Executes the program that `fd` refers to.

@@ -307,13 +307,11 @@ fn a_notify_filter_needs_a_listener_path() {
     if !privileged() {
         return;
     }
-    // Every spelling the filter compiler accepts, since it takes the name
-    // with or without its prefix and in any case.
-    for (name, action) in [
-        ("plain", "SCMP_ACT_NOTIFY"),
-        ("lower", "notify"),
-        ("bare", "NOTIFY"),
-    ] {
+    // Both spellings the filter compiler accepts. The prefix is part of the
+    // name the specification defines and is required; the case is not.
+    for (name, action) in
+        [("plain", "SCMP_ACT_NOTIFY"), ("lower", "scmp_act_notify")]
+    {
         let bundle = Bundle::with_config(
             &format!("notify-no-listener-{name}"),
             &["/usr/bin/true"],
@@ -355,10 +353,10 @@ fn an_impossible_preserve_count_is_refused() {
     if !privileged() {
         return;
     }
-    // Sixty-one is the first count whose block reaches the numbers the
-    // runtime renumbers its own descriptors onto; the wide one does not fit a
-    // descriptor number at all.
-    for count in ["61", "99999999999"] {
+    // Five hundred and nine is the first count whose block reaches the
+    // numbers the runtime renumbers its own descriptors onto; the wide one
+    // does not fit a descriptor number at all.
+    for count in ["509", "99999999999"] {
         let bundle =
             Bundle::new(&format!("preserve-{count}"), &["/usr/bin/true"]);
         let output =
