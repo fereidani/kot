@@ -172,6 +172,33 @@ lacks the mount API falls back to `mount(2)`, chosen once by a probe rather
 than per mount; `openat2` itself is required either way, since resolving a
 destination any other way would reintroduce that window.
 
+## Benchmark
+
+`tools/bench-runtimes.py` runs the same bundle through each runtime in turn
+and reports the wall-clock time of a whole `run`, the peak memory a container
+takes, and what the seccomp filter each runtime compiles costs every syscall
+the payload makes. A runtime that fails a run is left out. These are its
+numbers for kot 0.0.3, crun 1.29.1 and runc 1.5.1, the latest release of each
+at the time:
+
+- cpu: AMD Ryzen 9 9950X 16-Core Processor, Linux 7.2.6-x64v3-xanmod1
+- payload: `/bin/true`
+- runs per runtime: 50
+- filter column: nanoseconds per syscall over 400000 syscalls
+
+| runtime | median ms | min ms | max ms | peak MB | filter ns |
+|---|---|---|---|---|---|
+| kot | 0.9 | 0.7 | 1.3 | 1.0 | 4 |
+| crun | 1.6 | 1.3 | 1.9 | 1.4 | 5 |
+| runc | 33.3 | 6.1 | 50.2 | 11.5 | 6 |
+
+Every measured run makes a container, so it needs root. The runtimes to
+compare are looked up on `PATH` or named by path:
+
+```bash
+sudo python3 tools/bench-runtimes.py runc crun kot
+```
+
 ## Testing
 
 ```bash
