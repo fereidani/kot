@@ -2208,3 +2208,55 @@ fn a_detached_container_does_not_hold_the_caller_output_open() {
         "the runtime should leave no copy of the caller's output behind"
     );
 }
+
+/// destination has to match what is on its way there.
+#[test]
+fn a_bind_of_a_file_into_a_user_namespace_lands_on_a_file() {
+    if !privileged() {
+        return;
+    }
+    const MAPPED_ROOT: u32 = 100_000;
+
+    let closed =
+        std::env::temp_dir().join(format!("kot-closed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&closed);
+    std::fs::create_dir_all(&closed).expect("a host directory");
+    std::fs::write(closed.join("file"), "kept\n").expect("a host file");
+    std::fs::set_permissions(
+        &closed,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("closing the directory to everybody else");
+    let source = closed.join("file").display().to_string();
+
+    let bundle = Bundle::with_config(
+        "userns-file-bind",
+        &["/usr/bin/cat", "/carried"],
+        |config| {
+            in_user_namespace(config, MAPPED_ROOT);
+            *config = config.replace(
+                r#"    { "destination": "/proc", "type": "proc", "source": "proc" },"#,
+                &format!(
+                    r#"    {{ "destination": "/proc", "type": "proc", "source": "proc" }},
+    {{
+      "destination": "/carried",
+      "type": "bind",
+      "source": "{source}",
+      "options": ["bind", "ro"]
+    }},"#
+                ),
+            );
+        },
+    );
+    std::os::unix::fs::chown(
+        bundle.path().join("rootfs"),
+        Some(MAPPED_ROOT),
+        Some(MAPPED_ROOT),
+    )
+    .expect("giving the root filesystem to the container's root");
+
+    let output = bundle.runtime(&["run", &bundle.id()]);
+    let _ = std::fs::remove_dir_all(&closed);
+    expect_ok("run", &output);
+    assert_eq!(stdout(&output).trim(), "kept");
+}

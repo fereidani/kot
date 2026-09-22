@@ -1108,27 +1108,24 @@ impl Mount<'_> {
     ///
     /// A destination has to match what is being put on it: a bind of a file
     /// needs a file underneath, and a bind of a directory needs a directory.
-    /// The configuration rarely says which, so the source decides. Asked
-    /// only when something has to be made, since what the image ships is
-    /// used as it is and the kernel refuses a mismatch in the move.
-    fn wants_file(&self) -> Result<bool> {
+    /// The configuration rarely says which, so `file` answers it, read from
+    /// the detached tree rather than from the source path, which a process
+    /// in a user namespace may not be able to stat. Asked only when
+    /// something has to be made, since what the image ships is used as it
+    /// is and the kernel refuses a mismatch in the move.
+    fn wants_file(&self, file: impl FnOnce() -> bool) -> bool {
         if self.op.extra & mount_flag::DEST_IS_FILE != 0 {
-            return Ok(true);
+            return true;
         }
-        if !matches!(self.kind, MountKind::Bind | MountKind::RecursiveBind) {
-            return Ok(false);
-        }
-        match self.at.ahead {
-            Ahead::Made(tree) => Ok(tree_is_file(tree)),
-            _ => Ok(source_is_file(self.plan.c_str(self.op.source)?)),
-        }
+        matches!(self.kind, MountKind::Bind | MountKind::RecursiveBind)
+            && file()
     }
 
     /// How to open the destination: what is there, or else what to make.
-    fn creation(&mut self) -> Result<Create> {
+    fn creation(&mut self, file: impl FnOnce() -> bool) -> Result<Create> {
         Ok(match self.existing()? {
             Existing::File => Create::Nothing,
-            Existing::Nothing if self.wants_file()? => Create::File,
+            Existing::Nothing if self.wants_file(file) => Create::File,
             Existing::Directory | Existing::Nothing => Create::Directories,
         })
     }
@@ -1142,7 +1139,7 @@ impl Mount<'_> {
             self.resolver.invalidate(self.target);
             return Ok(());
         }
-        match self.creation()? {
+        match self.creation(|| tree_is_file(source))? {
             Create::Directories => {
                 let destination = self
                     .resolver
@@ -1177,13 +1174,13 @@ impl Mount<'_> {
             ));
         }
 
-        let create = self.creation()?;
+        let source_path = self.plan.c_str(self.op.source)?;
+        let create = self.creation(|| source_is_file(source_path))?;
         let destination = self.resolver.open(self.target, create)?;
         let mut path = PathBuf::<64>::new();
         path.push_str("/proc/self/fd/")?;
         path.push_u64(u64::from(destination.as_raw_fd().unsigned_abs()))?;
 
-        let source = self.plan.c_str(self.op.source)?;
         let fstype = self.plan.c_str(self.op.fstype)?;
         let flags = MountFlags::from_bits_retain(
             u32::try_from(self.op.flags & 0xffff_ffff)
@@ -1207,7 +1204,7 @@ impl Mount<'_> {
         } else {
             Some(options.as_c_str())
         };
-        mount(source, path.as_c_str(), fstype, flags, data)
+        mount(source_path, path.as_c_str(), fstype, flags, data)
             .context("mount: legacy mount")
     }
 }
