@@ -50,6 +50,8 @@ syscall_numbers! {
     SCHED_SETAFFINITY = "`sched_setaffinity(2)`", 203, 122;
     SCHED_SETATTR = "`sched_setattr(2)`", 314, 274;
     SECCOMP = "`seccomp(2)`", 317, 277;
+    SETFSGID = "`setfsgid(2)`", 123, 152;
+    SETFSUID = "`setfsuid(2)`", 122, 151;
     SETNS = "`setns(2)`", 308, 268;
     SIGNALFD4 = "`signalfd4(2)`", 289, 74;
     SET_MEMPOLICY = "`set_mempolicy(2)`", 238, 237;

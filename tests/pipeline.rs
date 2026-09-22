@@ -511,9 +511,14 @@ fn an_id_mapped_mount_names_the_namespace_it_needs() {
     let request = lowered.idmaps.first().expect("the request");
     assert_eq!(request.uid_ranges.len(), 1);
     assert_eq!(request.gid_ranges.len(), 1);
-    assert_eq!(request.uid_ranges[0].container_id, 1000);
-    assert_eq!(request.uid_ranges[0].host_id, 0);
-    assert_eq!(request.gid_ranges[0].container_id, 1000);
+    // The namespace behind a mount states the mapping the other way round
+    // from one a process enters: what it calls the outside is what the
+    // source filesystem holds, and what it calls the inside is what the
+    // mount shows. So the configuration's two columns arrive swapped.
+    assert_eq!(request.uid_ranges[0].container_id, 0);
+    assert_eq!(request.uid_ranges[0].host_id, 1000);
+    assert_eq!(request.gid_ranges[0].container_id, 0);
+    assert_eq!(request.gid_ranges[0].host_id, 1000);
 
     let view = View::new(&lowered.arena).expect("view");
     let mut seen = Vec::new();

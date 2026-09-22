@@ -553,8 +553,16 @@ fn write_mounts(
             op.idmap_fd = i32::try_from(out.idmaps.len())
                 .map_err(|_| Error::msg("mount: too many id mappings"))?;
             out.idmaps.push(IdmapRequest {
-                uid_ranges: source.uid_mappings.iter().map(range).collect(),
-                gid_ranges: source.gid_mappings.iter().map(range).collect(),
+                uid_ranges: source
+                    .uid_mappings
+                    .iter()
+                    .map(mount_range)
+                    .collect(),
+                gid_ranges: source
+                    .gid_mappings
+                    .iter()
+                    .map(mount_range)
+                    .collect(),
             });
         }
         op.encode(scratch.builder.records());
@@ -786,6 +794,21 @@ fn range(source: &spec::IdMapping) -> IdRange {
     IdRange {
         container_id: source.container_id,
         host_id: source.host_id,
+        size: source.size,
+    }
+}
+
+/// The same mapping, as the namespace behind an id-mapped mount states it.
+///
+/// A mount's mapping converts the ids the source filesystem holds into the
+/// ids the mount shows, and the kernel reads that namespace the other way
+/// round from a process's: its outside is what the filesystem holds, its
+/// inside is what the mount shows. So the two columns swap, and `0:100000`
+/// shows a file owned by zero as owned by a hundred thousand.
+fn mount_range(source: &spec::IdMapping) -> IdRange {
+    IdRange {
+        container_id: source.host_id,
+        host_id: source.container_id,
         size: source.size,
     }
 }

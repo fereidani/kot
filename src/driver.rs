@@ -201,8 +201,10 @@ fn start_container(request: &Request<'_>, clone_flags: u64) -> Result<Created> {
         pid,
         prepared: relay_end,
         in_cgroup,
+        idmaps,
     } = spawned;
-    let mut created = supervise(request, manager, socket, pid, in_cgroup)?;
+    let mut created =
+        supervise(request, manager, socket, pid, in_cgroup, &idmaps)?;
     created.terminal = relay_end
         .map(|socket| crate::terminal::receive(socket.as_fd()))
         .transpose()?;
@@ -236,6 +238,13 @@ pub(crate) struct Spawned<T> {
     /// True when the child was created inside the cgroup it was asked for,
     /// so nothing has to move it there.
     pub(crate) in_cgroup: bool,
+    /// The user namespaces carrying the id mapping of a mount, one per
+    /// mount record that names one.
+    ///
+    /// Init has its own copies. The driver keeps these because whoever
+    /// opens a source maps it, and mapping is a privilege over the source's
+    /// filesystem that a container's user namespace does not hold.
+    pub(crate) idmaps: Vec<OwnedFd>,
 }
 
 /// Clones a process and re-executes it from the sealed runtime image.
@@ -268,6 +277,13 @@ pub(crate) fn spawn_sealed<T>(
         })
         .collect::<crate::sys::error::Result<Vec<_>>>()
         .context("building the id mapping for a mount")?;
+    // One set for init and one for here: either side may be the one that
+    // opens a source.
+    let kept = idmaps
+        .iter()
+        .map(rustix::io::dup)
+        .collect::<std::result::Result<Vec<_>, rustix::io::Errno>>()
+        .context("keeping the id mapping for a mount")?;
     let (start_fifo, console_socket, prepared) = prepare()?;
     let args = InitArgs {
         namespaces: namespaces.len(),
@@ -329,6 +345,7 @@ pub(crate) fn spawn_sealed<T>(
                 pid,
                 prepared,
                 in_cgroup,
+                idmaps: kept,
             })
         }
     }
@@ -429,6 +446,7 @@ fn supervise(
     socket: OwnedFd,
     pid: i32,
     in_cgroup: bool,
+    idmaps: &[OwnedFd],
 ) -> Result<Created> {
     let &Request { spec, .. } = request;
 
@@ -447,6 +465,7 @@ fn supervise(
         pid,
         &mut manager,
         in_cgroup,
+        idmaps,
     ) {
         Ok(record) => record,
         Err(error) => {
@@ -489,6 +508,7 @@ fn configure(
     pid: i32,
     manager: &mut Manager,
     in_cgroup: bool,
+    idmaps: &[OwnedFd],
 ) -> Result<Record> {
     let &Request {
         options,
@@ -517,6 +537,12 @@ fn configure(
         ready.pid
     ));
 
+    // An init that had to fork to enter a pid namespace left the
+    // container's process behind it. Signalling the container, reading its
+    // state, entering its namespaces: all of them mean that process rather
+    // than the one waiting on it.
+    let payload = payload_process(pid);
+
     if lowered.creates_userns && !clone_userns {
         write_id_maps(request, pid, container.deny_setgroups, socket)?;
     }
@@ -526,9 +552,9 @@ fn configure(
     // Cache and bandwidth partitioning is a filesystem of its own rather
     // than part of the cgroup, so it is applied here beside the limits and
     // remembered so that `delete` can undo exactly what this made.
-    let rdt = apply_rdt(spec, &request.options.id, pid)?;
+    let rdt = apply_rdt(spec, &request.options.id, payload)?;
 
-    let record = build_record(request, manager, pid, &rdt);
+    let record = build_record(request, manager, payload, &rdt);
     // The process is this one's child and is waiting on the socket, so its
     // state is known without a look at `/proc`: what remains open is only
     // whether the payload runs at once or waits for `start`.
@@ -547,13 +573,13 @@ fn configure(
         hooks::run(&hooks.create_runtime, &state, &where_)?;
     }
 
-    finish_filesystem(request, socket, pid, &state, &where_)?;
+    finish_filesystem(request, socket, pid, &state, &where_, idmaps)?;
     release_payload(request, socket, pid, &record, &state, &where_)?;
 
     request.store.save(&record, status)?;
 
     if let Some(path) = options.pid_file.as_deref() {
-        std::fs::write(path, format!("{pid}\n"))
+        std::fs::write(path, format!("{payload}\n"))
             .with_context(|| format!("writing the pid file {path}"))?;
     }
 
@@ -606,8 +632,9 @@ fn finish_filesystem(
     pid: i32,
     state: &str,
     where_: &hooks::Environment<'_>,
+    idmaps: &[OwnedFd],
 ) -> Result<()> {
-    await_filesystem(request.plan, socket, pid)?;
+    await_filesystem(request.plan, socket, pid, idmaps)?;
     if let Some(hooks) = request.spec.hooks.as_ref() {
         hooks::run_in_container(
             pid,
@@ -681,12 +708,14 @@ fn await_filesystem(
     plan: &View<'_>,
     socket: BorrowedFd<'_>,
     pid: i32,
+    idmaps: &[OwnedFd],
 ) -> Result<()> {
     const DOING: &str = "waiting for the container's filesystem";
 
-    // One request per device in the plan, which is fixed: a longer sequence
-    // is a protocol error.
-    let limit = plan.count(crate::oci::plan::Section::Devices) as usize;
+    // One request per device and one per mount, both fixed by the plan: a
+    // longer sequence is a protocol error.
+    let limit = plan.count(crate::oci::plan::Section::Devices) as usize
+        + plan.count(crate::oci::plan::Section::Mounts) as usize;
     for _ in 0..=limit {
         let (message, passed) = sync::receive_fd(socket)
             .map_err(|e| anyhow::anyhow!("{e}"))
@@ -702,10 +731,79 @@ fn await_filesystem(
                 sync::send(socket, &Message::new(Kind::DeviceMade))
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
+            Kind::OpenSource => {
+                let source = open_source(plan, message.pid, idmaps)
+                    .context("opening a mount source for the container")?;
+                sync::send_fd(
+                    socket,
+                    &Message::new(Kind::SourceOpened),
+                    source.as_fd(),
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
             _ => return Err(init_failure(&message, DOING)),
         }
     }
     bail!("{DOING}: the container asked for more devices than it has")
+}
+
+/// Opens the source of the `index`th mount of the plan.
+///
+/// A source is a path on the host, reached with the identity the caller
+/// started the runtime with; init, inside the container's user namespace,
+/// may have no right to it. What crosses back is the detached mount, not
+/// the path, so the container resolves nothing.
+fn open_source(
+    plan: &View<'_>,
+    index: i32,
+    idmaps: &[OwnedFd],
+) -> Result<OwnedFd> {
+    use crate::oci::plan::record::{MountKind, mount_flag};
+
+    let wanted =
+        usize::try_from(index).context("the mount index is negative")?;
+    let mut at = 0usize;
+    let mut found = None;
+    plan.mounts(|op| {
+        if at == wanted {
+            found = Some(op);
+        }
+        at += 1;
+        Ok(())
+    })
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let op = found.context("the plan has no mount at that position")?;
+
+    let kind = op.mount_kind().context("the mount has an unknown kind")?;
+    if !matches!(kind, MountKind::Bind | MountKind::RecursiveBind) {
+        bail!("only a bind mount has a source to open");
+    }
+    let source = plan.c_str(op.source).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let recursive = kind == MountKind::RecursiveBind;
+    let tree = crate::linux::mount::clone_path(
+        source,
+        recursive,
+        op.extra & mount_flag::SRC_NOFOLLOW != 0,
+        "mount: clone source tree",
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Mapping is a privilege over the source's filesystem, which this
+    // process holds and the container does not, so it goes on here.
+    if let Ok(at) = usize::try_from(op.idmap_fd) {
+        let userns = idmaps
+            .get(at)
+            .context("the plan names an id mapping that was not made")?;
+        let attr =
+            crate::sys::mountattr::MountAttr::default().idmap(userns.as_fd());
+        crate::sys::mountattr::mount_setattr_fd(
+            tree.as_fd(),
+            op.extra & mount_flag::RECURSIVE != 0,
+            &attr,
+        )
+        .map_err(|e| anyhow::anyhow!("applying the id mapping: {e}"))?;
+    }
+    Ok(tree)
 }
 
 /// Creates the `index`th device of the plan in the directory init resolved.
@@ -765,7 +863,7 @@ fn nth_device(
     index: i32,
 ) -> Result<crate::oci::plan::record::DeviceOp> {
     let wanted =
-        usize::try_from(index).context("the device index is not one")?;
+        usize::try_from(index).context("the device index is negative")?;
     let mut at = 0usize;
     let mut found = None;
     plan.devices(|device| {
@@ -968,6 +1066,18 @@ impl Drop for Reaper {
     fn drop(&mut self) {
         if !self.armed {
             return;
+        }
+        // The container's own process first: when init forked to enter a
+        // pid namespace, killing the one this waits on would leave the
+        // other running with nothing left to stop it.
+        let payload = payload_process(self.pid);
+        if payload != self.pid {
+            if let Some(pid) = rustix::process::Pid::from_raw(payload) {
+                let _ = rustix::process::kill_process(
+                    pid,
+                    rustix::process::Signal::KILL,
+                );
+            }
         }
         if let Some(pid) = rustix::process::Pid::from_raw(self.pid) {
             let _ = rustix::process::kill_process(

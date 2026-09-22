@@ -193,6 +193,25 @@ pub fn enter_working_directory(
     fchdir(directory.as_fd()).context("process: chdir")
 }
 
+/// Takes the identity of the container's root, for the files the runtime
+/// makes inside it.
+///
+/// Device nodes, the directories a mount lands on, a working directory the
+/// image does not ship: all of them belong to the container. Made under the
+/// runtime's own identity they belong to a user the container cannot name,
+/// and on a filesystem its user namespace owns the kernel refuses them with
+/// `EOVERFLOW` rather than record an owner it cannot express.
+///
+/// Only the filesystem identity changes, so no capability is given up and
+/// the effective id stays what it was. A no-op outside a user namespace.
+pub fn adopt_container_root() -> Result<()> {
+    /// Root, as the namespace this process is in names it.
+    const ROOT: u32 = 0;
+
+    sys::set_fs_gid(ROOT)?;
+    sys::set_fs_uid(ROOT)
+}
+
 /// Puts this process in a process group of its own.
 ///
 /// A process group is named by a process id, and the group inherited from

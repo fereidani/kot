@@ -160,6 +160,41 @@ fn wait_for_child(pid: i32) -> i32 {
     1
 }
 
+/// Sets the filesystem user id.
+///
+/// The call reports no failure: an id the current user namespace does not
+/// map leaves the old one in place and still looks like success, so the
+/// only way to know is to ask again.
+pub fn set_fs_uid(uid: u32) -> Result<()> {
+    // SAFETY: the single argument is a scalar.
+    let _ = unsafe { syscall1(nr::SETFSUID, uid as usize) };
+    // SAFETY: as above. The answer is what the call before it left in
+    // place, which is the id now in force.
+    let now = unsafe { syscall1(nr::SETFSUID, uid as usize) };
+    if u32::try_from(now).is_ok_and(|current| current == uid) {
+        return Ok(());
+    }
+    Err(Error::msg(
+        "process: the container's user namespace does not map a root user \
+         for the runtime to build its filesystem as",
+    ))
+}
+
+/// The same for the group, whose failure is reported the same way.
+pub fn set_fs_gid(gid: u32) -> Result<()> {
+    // SAFETY: the single argument is a scalar.
+    let _ = unsafe { syscall1(nr::SETFSGID, gid as usize) };
+    // SAFETY: as above.
+    let now = unsafe { syscall1(nr::SETFSGID, gid as usize) };
+    if u32::try_from(now).is_ok_and(|current| current == gid) {
+        return Ok(());
+    }
+    Err(Error::msg(
+        "process: the container's user namespace does not map a root group \
+         for the runtime to build its filesystem as",
+    ))
+}
+
 /// Translates an id through the contents of a `uid_map` or `gid_map`.
 ///
 /// Each line is a container id, the host id it starts at, and how many ids

@@ -1268,7 +1268,11 @@ fn copy_symlink_recreates_the_link() {
 ///
 /// The mapping used to be parsed and then dropped, so the container saw the
 /// host's ownership and nothing reported that the request had gone nowhere.
-/// The file is owned by root outside and has to read as 1000 inside.
+///
+/// The mapping converts the ids the source filesystem holds into the ids
+/// the mount shows, so a file owned by the id the mapping calls the
+/// container's reads as the one it calls the host's. Here the file belongs
+/// to root outside and has to read as 1000 inside.
 #[test]
 fn an_id_mapped_mount_shifts_ownership() {
     if !privileged() {
@@ -1294,8 +1298,8 @@ fn an_id_mapped_mount_shifts_ownership() {
       "type": "bind",
       "source": "{source}",
       "options": ["bind"],
-      "uidMappings": [{{ "containerID": 1000, "hostID": 0, "size": 1 }}],
-      "gidMappings": [{{ "containerID": 1000, "hostID": 0, "size": 1 }}]
+      "uidMappings": [{{ "containerID": 0, "hostID": 1000, "size": 1 }}],
+      "gidMappings": [{{ "containerID": 0, "hostID": 1000, "size": 1 }}]
     }},"#
                 ),
             );
@@ -1680,5 +1684,258 @@ fn a_container_running_as_another_user_can_start() {
     assert!(
         wait_for_status(&bundle, "stopped"),
         "the container should have run and exited"
+    );
+}
+
+/// Puts a configuration in a user namespace whose root is a host id of its
+/// own, as an engine does for an image it unpacks for one user.
+fn in_user_namespace(config: &mut String, mapped_root: u32) {
+    *config = config.replace(
+        r#"      { "type": "cgroup" }"#,
+        r#"      { "type": "cgroup" },
+      { "type": "user" }"#,
+    );
+    *config = config.replace(
+        r#"    "maskedPaths""#,
+        &format!(
+            r#"    "uidMappings": [
+      {{ "containerID": 0, "hostID": {mapped_root}, "size": 65536 }}
+    ],
+    "gidMappings": [
+      {{ "containerID": 0, "hostID": {mapped_root}, "size": 65536 }}
+    ],
+    "maskedPaths""#
+        ),
+    );
+}
+
+/// A container whose user namespace does not map the runtime's own id
+/// still gets a filesystem, and one the container owns.
+///
+/// An engine unpacking an image for a user namespace gives it to that
+/// namespace's root, leaving the runtime's own user with no id there. The
+/// kernel will not record an owner it cannot express in the namespace that
+/// owns the filesystem, so a runtime building as itself gets `EOVERFLOW`
+/// and the container never starts.
+#[test]
+fn a_user_namespace_that_excludes_the_runtime_still_builds_a_filesystem() {
+    if !privileged() {
+        return;
+    }
+    /// The host id this container's root is, well clear of any real
+    /// account and with the runtime's own id outside the range.
+    const MAPPED_ROOT: u32 = 100_000;
+
+    let bundle = Bundle::with_config(
+        "userns-identity",
+        &["/usr/bin/sh", "-c", "stat -c %u:%g /dev/shm"],
+        |config| in_user_namespace(config, MAPPED_ROOT),
+    );
+    // As an engine unpacking an image for this namespace would: the root
+    // belongs to the container's root, which is this host id.
+    std::os::unix::fs::chown(
+        bundle.path().join("rootfs"),
+        Some(MAPPED_ROOT),
+        Some(MAPPED_ROOT),
+    )
+    .expect("giving the root filesystem to the container's root");
+
+    let output = bundle.runtime(&["run", &bundle.id()]);
+    expect_ok("run", &output);
+    assert_eq!(
+        stdout(&output).trim(),
+        "0:0",
+        "a filesystem the runtime made for the container belongs to the \
+         container's root, not to a user it cannot name"
+    );
+}
+
+/// A container that joins another's pid namespace is recorded, and killed,
+/// as the process that runs its payload.
+///
+/// Entering a pid namespace puts a process's children in it and never the
+/// process itself, so init forks and stays behind as a proxy. Recording the
+/// proxy, which is what the clone returned, lands everything done by number
+/// on the wrong process: a signal that leaves the payload running, a state
+/// document naming a process outside the container, a cgroup that cannot be
+/// removed.
+#[test]
+fn a_container_joining_a_pid_namespace_records_its_own_process() {
+    if !privileged() {
+        return;
+    }
+    let target = Bundle::new("pidns-target", &["/usr/bin/sleep", "600"]);
+    expect_ok("run", &target.runtime(&["run", "--detach", &target.id()]));
+    let Some((_, _, target_pid)) = state(&target) else {
+        panic!("the target container should report its state");
+    };
+
+    let attached = Bundle::with_config(
+        "pidns-attached",
+        &["/usr/bin/sleep", "600"],
+        |config| {
+            *config = config.replace(
+                r#"      { "type": "pid" },"#,
+                &format!(
+                    r#"      {{ "type": "pid", "path": "/proc/{target_pid}/ns/pid" }},"#
+                ),
+            );
+        },
+    );
+    expect_ok(
+        "run",
+        &attached.runtime(&["run", "--detach", &attached.id()]),
+    );
+    let Some((_, _, pid)) = state(&attached) else {
+        panic!("the attached container should report its state");
+    };
+
+    // The payload, not the process waiting on it: the program the
+    // configuration named rather than the runtime's own image.
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .unwrap_or_default();
+    assert_eq!(
+        comm.trim(),
+        "sleep",
+        "the state should name the process running the payload"
+    );
+
+    expect_ok("kill", &attached.runtime(&["kill", &attached.id(), "KILL"]));
+    let stopped = (0..200u32).any(|_| {
+        sleep(Duration::from_millis(10));
+        std::fs::read_to_string(format!("/proc/{pid}/comm")).is_err()
+    });
+    assert!(stopped, "killing the container should stop its payload");
+
+    let _ = attached.runtime(&["delete", "--force", &attached.id()]);
+    let _ = target.runtime(&["delete", "--force", &target.id()]);
+}
+
+/// A bind source the container's root cannot reach is still mounted.
+///
+/// The source is a host path the configuration named, and reaching it is
+/// the runtime's business rather than the container's. Init is the
+/// container's root by then and cannot open it, so the driver does and
+/// sends the mount over.
+#[test]
+fn a_bind_source_the_container_cannot_reach_is_still_mounted() {
+    if !privileged() {
+        return;
+    }
+    const MAPPED_ROOT: u32 = 100_000;
+
+    let secret =
+        std::env::temp_dir().join(format!("kot-secret-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&secret);
+    std::fs::create_dir_all(&secret).expect("a host directory");
+    std::fs::write(secret.join("file"), "kept\n").expect("a host file");
+    std::fs::set_permissions(
+        &secret,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("closing the directory to everybody else");
+    let source = secret.display().to_string();
+
+    let bundle = Bundle::with_config(
+        "userns-source",
+        &[
+            "/usr/bin/sh",
+            "-c",
+            "grep -c ' /secret ' /proc/self/mountinfo",
+        ],
+        |config| {
+            in_user_namespace(config, MAPPED_ROOT);
+            *config = config.replace(
+                r#"    { "destination": "/proc", "type": "proc", "source": "proc" },"#,
+                &format!(
+                    r#"    {{ "destination": "/proc", "type": "proc", "source": "proc" }},
+    {{
+      "destination": "/secret",
+      "type": "bind",
+      "source": "{source}",
+      "options": ["bind", "ro"]
+    }},"#
+                ),
+            );
+        },
+    );
+    std::os::unix::fs::chown(
+        bundle.path().join("rootfs"),
+        Some(MAPPED_ROOT),
+        Some(MAPPED_ROOT),
+    )
+    .expect("giving the root filesystem to the container's root");
+
+    let output = bundle.runtime(&["run", &bundle.id()]);
+    let _ = std::fs::remove_dir_all(&secret);
+    expect_ok("run", &output);
+    assert_eq!(
+        stdout(&output).trim(),
+        "1",
+        "the mount should be there, whatever the container may read of it"
+    );
+}
+
+/// A detached container leaves nothing of the runtime holding the caller's
+/// output.
+///
+/// A read of what the runtime printed ends when the last copy of that pipe
+/// closes. Init forks to enter a namespace `unshare` leaves it outside of,
+/// and the process left waiting has no use for those streams: holding them
+/// keeps the caller reading until the container exits, which for a detached
+/// one may be never.
+#[test]
+fn a_detached_container_does_not_hold_the_caller_output_open() {
+    if !privileged() {
+        return;
+    }
+    use std::{io::Read as _, os::fd::OwnedFd, process::Command};
+
+    // A time namespace is one of the two `unshare` cannot put this process
+    // in, so the runtime forks and leaves a process behind to wait.
+    let bundle = Bundle::with_config(
+        "detached-streams",
+        // The payload gives up the streams itself, so whatever keeps the
+        // pipe open afterwards belongs to the runtime.
+        &["/usr/bin/sh", "-c", "exec 1>&-; exec 2>&-; sleep 600"],
+        |config| {
+            *config = config.replace(
+                r#"      { "type": "cgroup" }"#,
+                r#"      { "type": "cgroup" },
+      { "type": "time" }"#,
+            );
+        },
+    );
+
+    // Close on exec, or the container inherits a copy of this pipe that
+    // nobody meant it to have and the test measures its own mistake.
+    let (reader, writer) =
+        rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+            .expect("a pipe");
+    let second: OwnedFd = writer.try_clone().expect("the other end");
+    let status = Command::new(RUNTIME)
+        .args(["--root", &bundle.state_root()])
+        .args(["run", "--detach", &bundle.id()])
+        .current_dir(bundle.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(writer))
+        .stderr(std::process::Stdio::from(second))
+        .status()
+        .expect("running the runtime");
+    assert!(status.success(), "the container should have started");
+
+    // Everything the runtime printed, read to the end. The container is
+    // still running, so an end that never comes is the failure.
+    rustix::io::ioctl_fionbio(&reader, true).expect("a non-blocking pipe");
+    let mut file = std::fs::File::from(reader);
+    let mut buffer = [0u8; 256];
+    let closed = (0..200u32).any(|_| {
+        sleep(Duration::from_millis(10));
+        matches!(file.read(&mut buffer), Ok(0))
+    });
+    let _ = bundle.runtime(&["delete", "--force", &bundle.id()]);
+    assert!(
+        closed,
+        "the runtime should leave no copy of the caller's output behind"
     );
 }

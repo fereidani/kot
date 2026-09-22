@@ -57,6 +57,13 @@ pub enum Kind {
     MakeDevice = 12,
     /// The driver has created the device node init asked for.
     DeviceMade = 13,
+    /// Init cannot reach a mount's source and asks the driver, which still
+    /// has the identity the runtime was started with, to open it.
+    ///
+    /// Carries the mount's position in the plan.
+    OpenSource = 14,
+    /// The driver has opened the source, which comes with this message.
+    SourceOpened = 15,
     /// Init could not do what it was asked.
     Failed = 8,
 }
@@ -76,6 +83,8 @@ impl Kind {
             11 => Some(Self::HooksRun),
             12 => Some(Self::MakeDevice),
             13 => Some(Self::DeviceMade),
+            14 => Some(Self::OpenSource),
+            15 => Some(Self::SourceOpened),
             _ => None,
         }
     }

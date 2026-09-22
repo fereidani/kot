@@ -307,6 +307,7 @@ fn spawn(
         pid,
         prepared: (),
         in_cgroup,
+        idmaps: _,
     } = driver::spawn_sealed(&process, prepare)?;
     supervise(options, &mut manager, socket, pid, in_cgroup, affinity)
 }

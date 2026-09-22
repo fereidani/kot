@@ -30,6 +30,16 @@ use crate::{
     },
 };
 
+/// Whether the plan says to enter somebody else's user namespace.
+fn joins_user_namespace(plan: &View<'_>) -> Result<bool> {
+    let mut joins = false;
+    plan.namespaces(|op| {
+        joins |= op.fd_index >= 0 && op.clone_flag == CLONE_NEWUSER;
+        Ok(())
+    })?;
+    Ok(joins)
+}
+
 /// Runs the container init process.
 ///
 /// Only returns on failure. On success the process has been replaced by the
@@ -141,10 +151,17 @@ impl Init<'_> {
             // or not a fork happened, and a second message from here would be
             // read as the answer to the next question it asks.
             // The child has already told the driver whatever went wrong.
-            Fork::Parent(pid) => wait_for(pid).map(|error| Failure {
-                error,
-                reported: true,
-            }),
+            Fork::Parent(pid) => {
+                // And it gives up the caller's streams, which it has no
+                // use for. A read of what the runtime printed ends when
+                // the last copy of that pipe closes, so a proxy holding
+                // one would keep the caller waiting for the container.
+                let _ = crate::sys::process::close_range(0, 2, 0);
+                wait_for(pid).map(|error| Failure {
+                    error,
+                    reported: true,
+                })
+            }
         }
     }
 
@@ -221,11 +238,17 @@ impl Init<'_> {
     /// before the driver has put this process in the container's cgroup. The
     /// driver says so exactly once, and only when the configuration asked for
     /// the namespace at all.
-    fn enter_cgroup_namespace(&self) -> Result<()> {
+    fn enter_cgroup_namespace(
+        &self,
+        already: &core::cell::Cell<bool>,
+    ) -> Result<()> {
         if !self.container.cgroup_namespace {
             return Ok(());
         }
-        sync::expect(self.socket, Kind::CgroupJoined)?;
+        // A source request may have taken the driver's word for it already.
+        if !already.replace(false) {
+            sync::expect(self.socket, Kind::CgroupJoined)?;
+        }
         namespace::unshare(crate::sys::clone::CLONE_NEWCGROUP)?;
         Ok(())
     }
@@ -239,9 +262,29 @@ impl Init<'_> {
         let root_path = plan.c_str(container.rootfs)?;
         let mut resolver = Resolver::new(root_path)?;
 
+        // Everything from here on is made inside the container and
+        // belongs to it. The bundle above was reached as the runtime's own
+        // user, which is whose bundle it is.
+        process::adopt_container_root()?;
+
         let joined = self.args.namespaces;
         let mut in_cgroup_namespace = false;
+        let mut index = 0i32;
+        let cgroup_joined = core::cell::Cell::new(false);
+        // Made or joined, either leaves this process without privilege
+        // over the filesystems its mount sources are on.
+        let in_user_namespace =
+            (container.clone_flags | container.unshare_flags) & CLONE_NEWUSER
+                != 0
+                || joins_user_namespace(plan)?;
         plan.mounts(|op| {
+            let at = mount::Source {
+                index,
+                socket: self.socket,
+                cgroup_joined: &cgroup_joined,
+                in_user_namespace,
+            };
+            index += 1;
             // Only a cgroup mount depends on the namespace, and it is the
             // last thing a stock bundle asks for. Waiting here rather than
             // before any of this is what lets the driver settle the container
@@ -251,7 +294,7 @@ impl Init<'_> {
             if !in_cgroup_namespace
                 && matches!(plan.text(op.fstype)?, "cgroup" | "cgroup2")
             {
-                self.enter_cgroup_namespace()?;
+                self.enter_cgroup_namespace(&cgroup_joined)?;
                 in_cgroup_namespace = true;
             }
             // A mount with an id mapping names the namespace carrying it by
@@ -271,10 +314,10 @@ impl Init<'_> {
                     return Err(Error::msg("mount: id mapping is missing"));
                 }
             };
-            mount::establish(plan, &mut resolver, &op, idmap)
+            mount::establish(plan, &mut resolver, &op, idmap, at)
         })?;
         if !in_cgroup_namespace {
-            self.enter_cgroup_namespace()?;
+            self.enter_cgroup_namespace(&cgroup_joined)?;
         }
         rootfs::create_devices(plan, &mut resolver, self.socket)?;
 

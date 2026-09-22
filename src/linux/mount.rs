@@ -27,7 +27,7 @@ use crate::{
         record::{MountKind, MountOp, mount_flag},
     },
     sys::{
-        error::{Context, EPERM, Error, Result},
+        error::{Context, EACCES, EPERM, Error, Result},
         mountattr::{self, MountAttr},
         path::{Path, PathBuf},
     },
@@ -486,6 +486,30 @@ pub(crate) fn clone_path(
     open_tree(rustix::fs::CWD, source, flags).context(context)
 }
 
+/// Asks the driver to open a mount's source and hand it over.
+fn request_source(at: Source<'_>) -> Result<OwnedFd> {
+    use crate::linux::sync::{self, Kind, Message};
+
+    let request = Message::with_pid(Kind::OpenSource, at.index);
+    sync::send(at.socket, &request)?;
+    // Two, because the driver's word about the cgroup is sent when it
+    // becomes true and can land between this request and its answer.
+    // Whoever waits for it later finds it already in hand.
+    for _ in 0..2 {
+        let (message, source) = sync::receive_fd(at.socket)?;
+        match message.kind {
+            Kind::SourceOpened => {
+                return source.ok_or_else(|| {
+                    Error::msg("mount: the source carried no mount")
+                });
+            }
+            Kind::CgroupJoined => at.cgroup_joined.set(true),
+            _ => return Err(Error::msg("mount: the driver sent no source")),
+        }
+    }
+    Err(Error::msg("mount: the driver sent no source"))
+}
+
 /// True for either cgroup filesystem.
 fn is_cgroup(fstype: &str) -> bool {
     matches!(fstype, "cgroup" | "cgroup2")
@@ -497,6 +521,7 @@ pub fn establish(
     resolver: &mut Resolver,
     op: &MountOp,
     idmap: Option<BorrowedFd<'_>>,
+    at: Source<'_>,
 ) -> Result<()> {
     let kind = op
         .mount_kind()
@@ -521,6 +546,7 @@ pub fn establish(
         target,
         create,
         idmap,
+        at,
     };
     let outcome = match kind {
         MountKind::MaskFile | MountKind::MaskDirectory => {
@@ -562,6 +588,30 @@ struct Mount<'a> {
     target: &'a [u8],
     create: Create,
     idmap: Option<BorrowedFd<'a>>,
+    at: Source<'a>,
+}
+
+/// Where this mount sits in the plan, and who to ask for its source.
+///
+/// A bind source is a path on the host, which init reaches as the
+/// container's root rather than as the runtime's own user. One that only
+/// the runtime's user can reach is still the caller's to mount, so the
+/// driver opens it and sends it over.
+#[derive(Clone, Copy)]
+pub struct Source<'a> {
+    /// The mount's position in the plan, which names it to the driver.
+    pub index: i32,
+    /// The socket the driver is listening on.
+    pub socket: BorrowedFd<'a>,
+    /// Set when the driver's word that the container is in its cgroup has
+    /// arrived. The driver sends it as soon as it is true, so it can land
+    /// in the middle of anything else.
+    pub cgroup_joined: &'a core::cell::Cell<bool>,
+    /// True when this process is in a user namespace of the container's.
+    ///
+    /// Mapping a mount is a privilege over the source's filesystem, which
+    /// such a namespace does not hold, so the driver does those.
+    pub in_user_namespace: bool,
 }
 
 impl Mount<'_> {
@@ -649,7 +699,7 @@ impl Mount<'_> {
             false,
             "mount: clone the host cgroup tree",
         )?;
-        self.apply_attributes(tree.as_fd())?;
+        self.apply_attributes(tree.as_fd(), true)?;
         self.attach(tree.as_fd())
     }
 
@@ -755,26 +805,46 @@ impl Mount<'_> {
         {
             return self.copy_symlink(source);
         }
+        // A mount this process cannot map is asked for before it is
+        // opened, not after a failure that leaves one half made.
+        let mapped_elsewhere =
+            self.idmap.is_some() && self.at.in_user_namespace;
         let nofollow = self.op.extra & mount_flag::SRC_NOFOLLOW != 0;
-        let tree = clone_path(
-            source,
-            recursive,
-            nofollow,
-            "mount: clone source tree",
-        )?;
-        self.apply_attributes(tree.as_fd())?;
+        let tree = if mapped_elsewhere {
+            request_source(self.at)?
+        } else {
+            match clone_path(
+                source,
+                recursive,
+                nofollow,
+                "mount: clone source tree",
+            ) {
+                Ok(tree) => tree,
+                // The container's root cannot reach it; the identity the
+                // runtime was started with still may, and that one is the
+                // driver's.
+                Err(e) if matches!(e.errno(), EACCES | EPERM) => {
+                    request_source(self.at)?
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        self.apply_attributes(tree.as_fd(), !mapped_elsewhere)?;
         self.attach(tree.as_fd())
     }
 
     /// Applies flag and id-mapping changes to a detached mount.
-    fn apply_attributes(&self, mount: BorrowedFd<'_>) -> Result<()> {
+    ///
+    /// `map` is false for a mount the driver opened, which carries the
+    /// mapping already. The kernel refuses a second one.
+    fn apply_attributes(&self, mount: BorrowedFd<'_>, map: bool) -> Result<()> {
         let mut attr = MountAttr {
             attr_set: self.op.attr_set,
             attr_clr: self.op.attr_clr,
             propagation: 0,
             userns_fd: 0,
         };
-        if let Some(userns) = self.idmap {
+        if let (true, Some(userns)) = (map, self.idmap) {
             attr = attr.idmap(userns);
         }
         if attr.is_empty() {

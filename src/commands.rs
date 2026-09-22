@@ -75,7 +75,7 @@ fn run(global: &Global, store: &Store, options: &Start) -> Result<i32> {
     // A signal sent to a runtime running a container in the foreground is
     // meant for the container, so until the container is gone they are
     // taken off this process and passed on.
-    let forwarding = crate::signals::Forwarding::install(created.pid)
+    let forwarding = crate::signals::Forwarding::install(created.record.pid)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("forwarding signals to the container")?;
 
