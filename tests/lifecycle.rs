@@ -628,9 +628,20 @@ fn a_seccomp_profile_is_enforced() {
     }
     // `chmod` is denied with a distinctive error number, so the payload can
     // tell the profile working apart from any other failure.
+    //
+    // It chmods a file it makes itself rather than a directory that exists
+    // on the host as well. The filter is what this test is about, and the
+    // isolation it runs behind is what other tests are about: if that
+    // isolation is broken, this payload should leave a stray empty file
+    // somewhere, not change the mode of a system directory.
     let bundle = Bundle::with_config(
         "seccomp",
-        &["/usr/bin/sh", "-c", "chmod 700 / 2>&1; echo done"],
+        &[
+            "/usr/bin/sh",
+            "-c",
+            "touch /seccomp-probe 2>/dev/null; \
+             chmod 700 /seccomp-probe 2>&1; echo done",
+        ],
         |config| {
             *config = config.replace(
                 r#""maskedPaths""#,
@@ -1353,6 +1364,79 @@ fn a_mount_propagation_mode_is_applied() {
         "1",
         "the mount should carry a peer group, which is what shared means"
     );
+}
+
+/// Detaching the old root after the pivot must not reach the host.
+///
+/// The namespace init starts in is a copy of the host's, and every mount in
+/// the copy is a peer of the one it came from. An unmount propagates to the
+/// peers of every mount in the tree it takes down, and detaching the old root
+/// takes down the whole tree. The runtime once severed only the mount the
+/// bundle sat on, and one container run then took the host's `/proc` and
+/// `/tmp` with it.
+///
+/// The container runs inside a namespace of the test's own, made a slave of
+/// the host and then shared, so the runtime's namespace is a peer of it and
+/// not of the host: whatever leaks lands here, where it can be counted
+/// safely. Both the default propagation and an explicitly shared tree are
+/// tried, because the second keeps the peers on purpose and relies on the old
+/// root being cut loose before it is detached.
+#[test]
+fn detaching_the_old_root_does_not_reach_the_host() {
+    if !privileged() {
+        return;
+    }
+    if std::process::Command::new("unshare")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        println!("skipping: unshare is not available");
+        return;
+    }
+    for mode in [None, Some("rshared")] {
+        let name = mode.unwrap_or("default");
+        let bundle = Bundle::with_config(
+            &format!("oldroot-{name}"),
+            &["/usr/bin/true"],
+            |config| {
+                if let Some(mode) = mode {
+                    *config = config.replace(
+                        r#"  "linux": {"#,
+                        &format!(
+                            r#"  "linux": {{
+    "rootfsPropagation": "{mode}","#
+                        ),
+                    );
+                }
+            },
+        );
+        // `findmnt` reads `/proc/self/mountinfo`, so losing `/proc` shows up
+        // as a count of nothing rather than as a smaller count.
+        let script = format!(
+            "mount --make-rshared / && \
+             before=$(findmnt -rn -o TARGET | wc -l) && \
+             {RUNTIME} --root {} run {} && \
+             after=$(findmnt -rn -o TARGET | wc -l) && \
+             echo \"$before $after\"",
+            bundle.state_root(),
+            bundle.id()
+        );
+        let output = std::process::Command::new("unshare")
+            .args(["--mount", "--propagation", "slave", "--", "sh", "-c"])
+            .arg(&script)
+            .current_dir(bundle.path())
+            .output()
+            .expect("running the runtime in a namespace of its own");
+        expect_ok(&format!("run with {name} propagation"), &output);
+        let text = stdout(&output);
+        let (before, after) = text.trim().split_once(' ').expect("two counts");
+        assert_eq!(
+            before, after,
+            "with {name} propagation the namespace should keep every mount \
+             it had, not go from {before} to {after}"
+        );
+    }
 }
 
 /// The container-wide mount label has to reach the mounts that take one.

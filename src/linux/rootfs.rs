@@ -3,8 +3,10 @@
 //! The order here is not arbitrary and is worth stating once, because getting
 //! it wrong produces a container that looks configured and is not:
 //!
-//! 1. Make the propagation of the whole tree private, so nothing the container
-//!    mounts escapes into the host.
+//! 1. Give the whole tree the propagation the configuration asked for, which is
+//!    private unless it said otherwise, and then make the mount the rootfs sits
+//!    on private whatever it said. Nothing the container mounts or unmounts may
+//!    reach the host unless the configuration asked for that.
 //! 2. Make the root a mount point in its own right, which `pivot_root` requires
 //!    and which most bundles do not arrange themselves.
 //! 3. Establish the configured mounts, in the order the configuration gave.
@@ -66,19 +68,44 @@ const DEV_SYMLINKS: [(&str, &str); 4] = [
     ("/proc/self/fd/2", "/dev/stderr"),
 ];
 
-/// Makes the mount tree private and turns the root into a mount point.
+/// Sets the tree's propagation and turns the root into a mount point.
 pub fn prepare(container: &Container, plan: &View<'_>) -> Result<()> {
     use rustix::mount::{MountFlags, MountPropagationFlags, mount_change};
 
-    // Without this, a mount the container makes could propagate back into the
-    // host's tree, which is the difference between an isolated filesystem and
-    // a shared one.
+    // The namespace init was made in is a copy of the host's, and every mount
+    // in the copy is still a peer of the one it was copied from. Left that
+    // way, whatever the container mounts under one of them appears on the
+    // host as well, and whatever it unmounts disappears from the host. The
+    // detach of the old root after the pivot is exactly such an unmount, of
+    // the whole tree at once: with the peers still in place it takes the
+    // host's `/proc`, `/sys`, `/dev` and `/tmp` down with it.
+    //
+    // So the whole tree is changed, recursively, before anything else. The
+    // default is private, which severs every relationship. A configuration
+    // that names a mode gets that mode instead; asking for `shared` is asking
+    // to keep the host as a peer, and the two places that would then carry a
+    // change back out, the detach of the old root and the move on the chroot
+    // path, cut the link themselves first.
     let propagation = if container.rootfs_propagation == 0 {
         MountPropagationFlags::PRIVATE | MountPropagationFlags::REC
     } else {
         propagation_flags(container.rootfs_propagation)
     };
     mount_change("/", propagation).context("rootfs: set propagation")?;
+
+    // The mount the rootfs sits on is made private whatever the configuration
+    // said, and only that one. `pivot_root` refuses a new root whose parent
+    // mount is shared, and the self-bind below would otherwise land on the
+    // host too. Private rather than slave because a slave still receives
+    // mounts from its master, and a bundle directory the host mounts things
+    // under is not a place the container should watch.
+    //
+    // A rootfs the mount table has no entry for is left to the recursive
+    // change above, which has already covered whichever mount it is on.
+    if let Some(parent) = parent_mount_of(plan.text(container.rootfs)?) {
+        mount_change(&parent, MountPropagationFlags::PRIVATE)
+            .context("rootfs: detach the bundle's mount from its peers")?;
+    }
 
     // `pivot_root` refuses a new root that is not itself a mount point, and a
     // bundle's rootfs is usually a plain directory.
@@ -261,15 +288,35 @@ fn bind_host_device(
 /// on the new one and is detached immediately afterwards.
 pub fn pivot(root: BorrowedFd<'_>) -> Result<()> {
     use rustix::{
-        mount::{UnmountFlags, unmount},
+        mount::{MountPropagationFlags, UnmountFlags, mount_change, unmount},
         process::{chdir, fchdir, pivot_root},
     };
 
+    // A descriptor for the old root, taken now because afterwards no path
+    // names it. Once it is stacked on the new root, a lookup of `.` or `/`
+    // stops at the new root and never climbs onto what sits above it; only
+    // `umount` climbs, which is why the sequence below could detach the old
+    // root by name but could not change its propagation by name.
+    let old = open_directory(c"/", "rootfs: open the old root")?;
     fchdir(root).context("rootfs: enter new root")?;
     pivot_root(c".", c".").context("rootfs: pivot")?;
-    // The old root is now stacked on the new one at the same point. Detaching
-    // rather than unmounting lets anything still using it finish, while making
-    // it unreachable by name, which is all that matters here.
+
+    // The old root's tree is detached rather than unmounted, so that anything
+    // still using it can finish, but an unmount of either kind propagates to
+    // the peers of every mount in the tree. When the configuration kept the
+    // tree shared with the host, those peers are the host's own mounts, and
+    // detaching the old root would take the host's `/proc`, `/sys` and the
+    // rest down with it. Making the old tree a slave first keeps it receiving
+    // what the host mounts, which is what a shared configuration wanted, and
+    // stops anything travelling the other way. With the default private tree
+    // it changes nothing. The new root is no longer part of that tree, so
+    // the container's own mounts keep whatever mode they were given.
+    fchdir(&old).context("rootfs: enter the old root")?;
+    mount_change(
+        ".",
+        MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC,
+    )
+    .context("rootfs: sever the old root from the host")?;
     unmount(c".", UnmountFlags::DETACH).context("rootfs: detach old root")?;
     chdir(c"/").context("rootfs: return to root")
 }
@@ -278,11 +325,64 @@ pub fn pivot(root: BorrowedFd<'_>) -> Result<()> {
 ///
 /// Weaker, and only used when the caller explicitly asks, because a `chroot`
 /// can be escaped by a process that holds a descriptor outside it.
+///
+/// The new root is moved over the old one before the `chroot` rather than
+/// simply being changed into. A `chroot` on its own leaves the old root as
+/// the parent of the container's, with the host's `/proc`, `/sys` and every
+/// other mount the runtime inherited still hanging off it; moving the new
+/// root puts it in that place instead, so the container's root is nobody's
+/// child and the old tree cannot be walked to from inside.
+///
+/// That is the same sequence a system uses to leave its initial filesystem
+/// behind, and it is what this path can do. It is still not `pivot_root`:
+/// the mounts that were in the namespace remain in it, unreachable by name
+/// but present, and the kernel decides whether a process may mount a fresh
+/// `proc` by looking for a fully visible one in the namespace rather than
+/// by looking at paths. A container with both this option and the privilege
+/// to mount can therefore still reach the host's process table. That is the
+/// cost of asking for the weaker root change, and the reason the option is
+/// opt-in.
 pub fn chroot(root: BorrowedFd<'_>) -> Result<()> {
-    use rustix::process::{chdir, fchdir};
+    use rustix::{
+        mount::{MountPropagationFlags, mount_change, mount_move},
+        process::{chdir, fchdir},
+    };
+
     fchdir(root).context("rootfs: enter new root")?;
+    // A mount moved onto a shared mount is mounted onto its peers as well,
+    // and when the configuration kept the tree shared with the host the peer
+    // of the old root is the host's root. The old root is made a slave
+    // first, for the same reason the pivot path does it before detaching:
+    // what the host mounts still arrives, and nothing goes back. Only the
+    // one mount, because the move lands on it alone and the new root still
+    // hangs beneath it, carrying the modes the configuration gave it.
+    mount_change("/", MountPropagationFlags::DOWNSTREAM)
+        .context("rootfs: sever the old root from the host")?;
+    // The classic call rather than the newer interface: this path exists for
+    // hosts the newer one is not available on, and the working directory
+    // follows the mount it names, so `.` is still the new root afterwards.
+    mount_move(c".", c"/")
+        .context("rootfs: move the new root over the old one")?;
     rustix::process::chroot(c".").context("rootfs: chroot")?;
     chdir(c"/").context("rootfs: return to root")
+}
+
+/// Applies the propagation the configuration asked the container's root to
+/// have.
+///
+/// Runs after the root has changed, and only then. Before that point the
+/// rootfs is still attached to the host's tree, and anything but private
+/// would send the container's own setup back out along it. Afterwards the
+/// root has no peers left, so making it shared starts a peer group of the
+/// container's own, which is what asking for it means.
+pub fn apply_propagation(container: &Container) -> Result<()> {
+    use rustix::mount::mount_change;
+
+    if container.rootfs_propagation == 0 {
+        return Ok(());
+    }
+    mount_change("/", propagation_flags(container.rootfs_propagation))
+        .context("rootfs: set the propagation the container asked for")
 }
 
 /// Hides or restricts the paths the configuration names.
@@ -346,8 +446,7 @@ fn mask(target: BorrowedFd<'_>) -> Result<()> {
         )
         .context("paths: materialise tmpfs")?
     } else {
-        let tree =
-            clone_path(c"/dev/null", false, false, "paths: clone /dev/null")?;
+        let tree = clone_null()?;
         // Read only, so that a masked path cannot be written to at all rather
         // than having writes quietly swallowed. `nodev` is deliberately not
         // set: it would stop the character device being opened as one, and
@@ -474,4 +573,87 @@ fn propagation_flags(value: u64) -> rustix::mount::MountPropagationFlags {
 pub fn open_root(plan: &View<'_>, container: &Container) -> Result<OwnedFd> {
     let path = plan.c_str(container.rootfs)?;
     open_directory(path, "rootfs: open")
+}
+
+/// Clones the container's null device, having checked that it is one.
+///
+/// Every masked file is covered by a read-only bind of `/dev/null`, taken
+/// from inside the container because that is where the mask is going. The
+/// image controls what is at that path: a symbolic link there would be
+/// followed, and a file of the image's own would be bound in place of the
+/// device. Either way the path the configuration asked to have hidden would
+/// instead show something the image chose, mounted by the runtime.
+///
+/// So the path is opened without following a link and checked to be the
+/// character device the kernel numbers one and three, and the bind is taken
+/// from that descriptor rather than from the name a second time.
+fn clone_null() -> Result<OwnedFd> {
+    use rustix::{
+        fs::{FileType, Mode, OFlags, fstat, major, minor, open},
+        mount::{OpenTreeFlags, open_tree},
+    };
+
+    /// The kernel's numbers for the null device.
+    const NULL_DEVICE: (u32, u32) = (1, 3);
+
+    let device = open(
+        c"/dev/null",
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .context("paths: open the null device")?;
+    let stat = fstat(&device).context("paths: inspect the null device")?;
+    let is_null = FileType::from_raw_mode(stat.st_mode)
+        == FileType::CharacterDevice
+        && (major(stat.st_rdev), minor(stat.st_rdev)) == NULL_DEVICE;
+    if !is_null {
+        return Err(Error::msg(
+            "paths: /dev/null in the image is not the null device",
+        ));
+    }
+
+    open_tree(
+        device.as_fd(),
+        c"",
+        OpenTreeFlags::OPEN_TREE_CLONE
+            | OpenTreeFlags::OPEN_TREE_CLOEXEC
+            | OpenTreeFlags::AT_EMPTY_PATH,
+    )
+    .context("paths: clone the null device")
+}
+
+/// The mount point the given path sits on, from the kernel's mount table.
+///
+/// The longest mount point that is a prefix of the path is the mount the
+/// path belongs to, because a nested mount is always a longer prefix than
+/// the one it hides. The comparison is by whole components, so `/var` does
+/// not match a path under `/variable`.
+fn parent_mount_of(path: &str) -> Option<String> {
+    let table = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mut best: Option<&str> = None;
+    for line in table.lines() {
+        // The mount point is the fifth field, and the fields before it
+        // never contain a space.
+        let Some(point) = line.split_ascii_whitespace().nth(4) else {
+            continue;
+        };
+        if !covers(point, path) {
+            continue;
+        }
+        if best.is_none_or(|found| point.len() > found.len()) {
+            best = Some(point);
+        }
+    }
+    best.map(str::to_owned)
+}
+
+/// Whether `point` is `path` or a directory containing it.
+fn covers(point: &str, path: &str) -> bool {
+    if point == "/" {
+        return true;
+    }
+    let Some(rest) = path.strip_prefix(point) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('/')
 }
