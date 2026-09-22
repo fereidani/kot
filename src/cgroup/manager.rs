@@ -26,6 +26,7 @@ use crate::{
             systemd::{self, Mode, Property},
         },
         layout::{self, Layout},
+        unit::{self, UnitProperty},
         v1, v2,
         write::{self, Writes},
     },
@@ -96,6 +97,8 @@ pub struct Manager {
     scope_carries_limits: bool,
     /// Descriptor of the container's directory, once it exists.
     directory: Option<OwnedFd>,
+    /// Properties the configuration put on the unit through annotations.
+    unit_properties: Vec<UnitProperty>,
     /// One directory per controller, on the legacy hierarchy.
     ///
     /// Each legacy controller is a separate tree with its own mount point, so
@@ -128,6 +131,7 @@ impl Manager {
             connection: None,
             pending: None,
             scope_carries_limits: false,
+            unit_properties: Vec::new(),
             directory: None,
         };
 
@@ -430,6 +434,26 @@ impl Manager {
         Ok(self.opened())
     }
 
+    /// Takes the unit properties an annotation set names.
+    ///
+    /// Only the systemd manager has a unit to put them on; elsewhere they
+    /// describe something that does not exist, which is the configuration's
+    /// mistake to make rather than this runtime's to refuse.
+    ///
+    /// # Errors
+    ///
+    /// When an annotation names a property this runtime cannot write.
+    pub fn take_unit_properties(
+        &mut self,
+        annotations: &[(&str, &str)],
+    ) -> Result<()> {
+        if self.kind != Kind::Systemd {
+            return Ok(());
+        }
+        self.unit_properties = unit::from_annotations(annotations)?;
+        Ok(())
+    }
+
     /// The configured path, relative to whichever hierarchy root applies.
     fn relative(&self) -> Result<&str> {
         core::str::from_utf8(self.path.as_bytes())
@@ -462,6 +486,10 @@ impl Manager {
         properties.push(Property::Bool("DefaultDependencies", false));
         properties.push(Property::Pids("PIDs", &pids));
         push_systemd_properties(self.layout, resources, &mut properties)?;
+        // Last, so a property the configuration named itself decides.
+        for property in &self.unit_properties {
+            properties.push(property.as_property());
+        }
 
         let connection =
             connection(&mut self.connection, "cgroup: no connection")?;

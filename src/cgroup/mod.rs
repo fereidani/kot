@@ -16,6 +16,7 @@ pub mod dbus;
 pub mod devices;
 pub mod layout;
 pub mod manager;
+pub mod unit;
 pub mod v1;
 pub mod v2;
 pub mod write;

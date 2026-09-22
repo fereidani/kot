@@ -43,6 +43,12 @@ pub enum Property<'a> {
     U64(&'a str, u64),
     /// The `PIDs` property, which places existing processes in the unit.
     Pids(&'a str, &'a [u32]),
+    /// A 32-bit unsigned value, which some unit properties are typed as.
+    U32(&'a str, u32),
+    /// A 64-bit signed value, likewise.
+    I64(&'a str, i64),
+    /// A 32-bit signed value, such as `KillSignal`.
+    I32(&'a str, i32),
 }
 
 impl Property<'_> {
@@ -51,13 +57,19 @@ impl Property<'_> {
         let (Self::Str(name, _)
         | Self::Bool(name, _)
         | Self::U64(name, _)
-        | Self::Pids(name, _)) = self;
+        | Self::Pids(name, _)
+        | Self::U32(name, _)
+        | Self::I64(name, _)
+        | Self::I32(name, _)) = self;
         w.string(name)?;
         match self {
             Self::Str(_, value) => w.variant_string(value),
             Self::Bool(_, value) => w.variant_bool(value),
             Self::U64(_, value) => w.variant_u64(value),
             Self::Pids(_, pids) => w.variant_u32_array(pids),
+            Self::U32(_, value) => w.variant_u32(value),
+            Self::I64(_, value) => w.variant_i64(value),
+            Self::I32(_, value) => w.variant_i32(value),
         }
     }
 }

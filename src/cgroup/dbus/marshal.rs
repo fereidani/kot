@@ -160,6 +160,31 @@ impl<'a> Writer<'a> {
         Ok(())
     }
 
+    /// Writes a variant holding a 32-bit unsigned integer.
+    pub fn variant_u32(&mut self, value: u32) -> Result<()> {
+        self.signature("u")?;
+        self.u32(value);
+        Ok(())
+    }
+
+    /// Writes a variant holding a 64-bit signed integer.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn variant_i64(&mut self, value: i64) -> Result<()> {
+        self.signature("x")?;
+        // The wire carries the bits, which is what the cast keeps.
+        self.u64(value as u64);
+        Ok(())
+    }
+
+    /// Writes a variant holding a 32-bit signed integer.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn variant_i32(&mut self, value: i32) -> Result<()> {
+        self.signature("i")?;
+        // As above.
+        self.u32(value as u32);
+        Ok(())
+    }
+
     /// Writes a variant holding an array of 32-bit unsigned integers.
     pub fn variant_u32_array(&mut self, values: &[u32]) -> Result<()> {
         self.signature("au")?;

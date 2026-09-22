@@ -622,3 +622,64 @@ fn a_scope_is_found_where_the_manager_that_made_it_puts_it() {
         "a user manager's scope belongs below its own service: {computed}"
     );
 }
+
+/// A property an annotation names has to reach the unit.
+///
+/// An engine tells the runtime how the container should be stopped by naming
+/// the systemd property, and a scope made without it is stopped some other
+/// way than the one that was asked for.
+#[test]
+fn properties_named_by_annotations_reach_the_unit() {
+    let Some(mut connection) = connect() else {
+        return;
+    };
+    let Some(victim) = Victim::spawn() else {
+        println!("skipping: no sleep binary");
+        return;
+    };
+    let name = format!("kot-test-annotated-{}.scope", std::process::id());
+
+    // The second is stated in seconds, which systemd takes in microseconds
+    // under a name of its own.
+    let annotations = [
+        ("org.systemd.property.KillSignal", "5"),
+        ("org.systemd.property.TimeoutStopSec", "uint64 7"),
+    ];
+    let named =
+        kot::cgroup::unit::from_annotations(&annotations).expect("annotations");
+
+    let pids = [victim.pid()];
+    let mut properties = vec![
+        Property::Str("Description", "kot test scope"),
+        Property::Bool("Delegate", true),
+        Property::Bool("DefaultDependencies", false),
+        Property::Pids("PIDs", &pids),
+    ];
+    properties.extend(
+        named
+            .iter()
+            .map(kot::cgroup::unit::UnitProperty::as_property),
+    );
+    systemd::start_transient_unit(
+        &mut connection,
+        &name,
+        Mode::Replace,
+        &properties,
+    )
+    .expect("StartTransientUnit");
+
+    assert!(
+        wait_for(|| scope_path(&name).is_dir()).is_some(),
+        "scope cgroup never appeared"
+    );
+    let shown = |property: &str| -> String {
+        let output = Command::new("systemctl")
+            .args(["show", "-p", property, &name])
+            .output()
+            .expect("systemctl show");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    assert_eq!(shown("KillSignal"), "KillSignal=5");
+    assert_eq!(shown("TimeoutStopUSec"), "TimeoutStopUSec=7s");
+    cleanup(&name);
+}

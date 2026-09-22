@@ -162,6 +162,11 @@ fn start_container(request: &Request<'_>, clone_flags: u64) -> Result<Created> {
     let cgroups_path = spec.linux.as_ref().and_then(|linux| linux.cgroups_path);
     let mut manager =
         Manager::new(request.global.cgroup_manager, cgroups_path, &options.id)?;
+    // The configuration may put properties on the container's unit, which
+    // systemd takes when the scope is made rather than after.
+    manager
+        .take_unit_properties(&spec.annotations)
+        .context("reading the unit properties the annotations name")?;
     // Made before the clone so that init can be born in it rather than moved
     // into it, which is the difference described at the top of this file.
     let placement = manager
