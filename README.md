@@ -27,12 +27,30 @@ no `libcap`: the seccomp compiler, the D-Bus client, and the capability handling
 are all in the crate, so the whole runtime is one static binary of about a
 megabyte with three direct dependencies.
 
-## Usage
+## Install
 
-Build it:
+From crates.io:
 
 ```bash
-cargo build --release
+cargo install kot
+```
+
+From source:
+
+```bash
+git clone https://github.com/fereidani/kot
+cd kot
+make
+sudo make install
+```
+
+`make` builds the release binary and `sudo make install` copies it to
+`/usr/local/bin`, which is why that step needs root. Set `PREFIX` to install
+somewhere else and `DESTDIR` to stage it into a package root; `sudo make
+uninstall` removes it again.
+
+```bash
+make PREFIX=/usr DESTDIR=/tmp/pkg install
 ```
 
 For a binary with nothing to link against at all:
@@ -41,11 +59,18 @@ For a binary with nothing to link against at all:
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Then hand it to an engine as the runtime to use:
+## Usage
+
+Hand it to an engine as the runtime to use:
 
 ```bash
 podman --runtime /path/to/kot run --rm docker.io/library/alpine echo hello
 ```
+
+`/path/to/kot` is wherever the binary landed: `/usr/local/bin/kot` after `sudo
+make install`, `~/.cargo/bin/kot` after `cargo install kot`, or
+`target/release/kot` in a build tree. `command -v kot` prints the one on your
+`PATH`.
 
 Or drive it directly, the way an engine would:
 
@@ -108,9 +133,11 @@ into a `Spec` that borrows the file it was read from, validated once, and
 lowered into a plan: one flat arena addressed by offsets rather than pointers,
 sealed into a memory file the container init process maps read only. Because
 the arena is the wire format, there is no serialisation step, and because every
-question was answered while the plan was built, init has no parser, allocates
-nothing, and makes no decisions. What is left for it is syscalls, and the only
-failures left are the kernel's.
+question was answered while the plan was built, init parses nothing and decides
+nothing. What is left for it is syscalls, and the only failures left are the
+kernel's. The memory it does take is its own working space, a buffer for the
+filter it installs and a cache of the directories it has resolved, never the
+configuration.
 
 **The runtime cannot be overwritten through the container.** Init runs from a
 private read-only overlay of the directory the binary lives in, mounted nowhere
@@ -121,9 +148,12 @@ that, because it shares its inode with the mount it came from.
 
 **Mounts go through the kernel's newer interface.** `fsopen`, `fsmount`,
 `open_tree`, `move_mount`, and `mount_setattr`, with destinations resolved by
-`openat2` under `RESOLVE_IN_ROOT` so the kernel does the confinement and there
-is no window between checking a path and using it. Hosts without it fall back
-to `mount(2)`, selected once by a probe rather than per mount.
+`openat2` under `RESOLVE_BENEATH` and `RESOLVE_NO_MAGICLINKS`, relative to a
+descriptor for the container's root, so the kernel does the confinement and
+there is no window between checking a path and using it. A host whose kernel
+lacks the mount API falls back to `mount(2)`, chosen once by a probe rather
+than per mount; `openat2` itself is required either way, since resolving a
+destination any other way would reintroduce that window.
 
 ## Testing
 
