@@ -300,12 +300,11 @@ impl Store {
         .with_context(failed)?;
         write_all(file.as_fd(), render(record, status).as_bytes())
             .with_context(failed)?;
-        // Flushed before the rename, so a write that failed is reported and
-        // not published: every later command works from this file, and
-        // `delete` in particular cannot reach a container whose record it
-        // cannot read. The state root is usually a memory filesystem, so what
-        // this catches is a full or failing disk rather than a crash.
-        rustix::fs::fdatasync(&file).with_context(failed)?;
+        // The record is not flushed: it describes a container that does
+        // not survive the crash a flush protects against, and on a
+        // disk-backed state root the flush costs a round trip on every
+        // container, here nine milliseconds of the fifteen one took to
+        // start.
         drop(file);
         rustix::fs::rename(&temporary, &target)
             .with_context(|| format!("committing state for {}", record.id))

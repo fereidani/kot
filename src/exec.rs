@@ -309,7 +309,34 @@ fn spawn(
         in_cgroup,
         idmaps: _,
     } = driver::spawn_sealed(&process, prepare)?;
-    supervise(options, &mut manager, socket, pid, in_cgroup, affinity)
+    let plan = View::new(&lowered.arena)?;
+    supervise(
+        options,
+        &mut manager,
+        Waiting {
+            plan: &plan,
+            record,
+            socket,
+            pid,
+            in_cgroup,
+        },
+        affinity,
+    )
+}
+
+/// What the handshake below works on: the process just made, and the
+/// container it was made inside.
+struct Waiting<'a> {
+    /// The plan the process was built from, which says what it will ask for.
+    plan: &'a View<'a>,
+    /// The container's own record, for anything that names the container.
+    record: &'a Record,
+    /// The socket init reports on.
+    socket: OwnedFd,
+    /// The process the clone returned.
+    pid: i32,
+    /// Whether the clone placed it in the container's cgroup.
+    in_cgroup: bool,
 }
 
 /// Drives the handshake and waits for the process.
@@ -317,11 +344,16 @@ fn spawn(
 fn supervise(
     options: &Exec,
     manager: &mut Manager,
-    socket: OwnedFd,
-    pid: i32,
-    in_cgroup: bool,
+    waiting: Waiting<'_>,
     affinity: &Affinity,
 ) -> Result<i32> {
+    let Waiting {
+        plan,
+        record,
+        socket,
+        pid,
+        in_cgroup,
+    } = waiting;
     // As in `create`: the id the process reports is the one it sees inside
     // the container, so what the runtime acts on is the clone's own answer.
     driver::await_init(socket.as_fd(), Kind::Ready, "waiting for the process")?;
@@ -357,6 +389,15 @@ fn supervise(
         .context("applying the CPU affinity for the process")?;
 
     sync::send(socket.as_fd(), &Message::new(Kind::Proceed))?;
+
+    // A profile with a notify action suspends every matching syscall until
+    // an agent answers, so the descriptor has to reach the agent before the
+    // program runs. The listener belongs to the process just made rather
+    // than to the container's own, and that is the process the agent has to
+    // name when it answers for it.
+    let mut owner = record.clone();
+    owner.pid = payload;
+    driver::deliver_seccomp_listener(plan, &owner, socket.as_fd())?;
 
     // Applying the process settings is the last thing the new process does
     // that its configuration can make fail, so the answer is waited for even

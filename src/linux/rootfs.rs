@@ -105,10 +105,16 @@ pub fn prepare(container: &Container, plan: &View<'_>) -> Result<()> {
     // under is not a place the container should watch.
     //
     // A rootfs the mount table has no entry for is left to the recursive
-    // change above, which has already covered whichever mount it is on.
-    if let Some(parent) = parent_mount_of(plan.text(container.rootfs)?) {
-        mount_change(&parent, MountPropagationFlags::PRIVATE)
-            .context("rootfs: detach the bundle's mount from its peers")?;
+    // change above, which has already covered whichever mount it is on. So
+    // is every rootfs when the configuration named no mode: the recursive
+    // change was to private, which is what this one asks for, and finding
+    // the mount would cost a read and a parse of the whole mount table to
+    // repeat it.
+    if container.rootfs_propagation != 0 {
+        if let Some(parent) = parent_mount_of(plan.text(container.rootfs)?) {
+            mount_change(&parent, MountPropagationFlags::PRIVATE)
+                .context("rootfs: detach the bundle's mount from its peers")?;
+        }
     }
 
     // `pivot_root` refuses a new root that is not itself a mount point, and a
@@ -618,12 +624,6 @@ fn propagation_flags(value: u64) -> rustix::mount::MountPropagationFlags {
     flags
 }
 
-/// Opens the container root so it can be pivoted into.
-pub fn open_root(plan: &View<'_>, container: &Container) -> Result<OwnedFd> {
-    let path = plan.c_str(container.rootfs)?;
-    open_directory(path, "rootfs: open")
-}
-
 /// Clones the container's null device, having checked that it is one.
 ///
 /// Every masked file is covered by a read-only bind of `/dev/null`, taken
@@ -678,7 +678,13 @@ fn clone_null() -> Result<OwnedFd> {
 /// the one it hides. The comparison is by whole components, so `/var` does
 /// not match a path under `/variable`.
 fn parent_mount_of(path: &str) -> Option<String> {
-    let table = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    // Procfs reports no size for the table, so the buffer is sized for a
+    // busy host's up front; a read loop that starts from nothing spends a
+    // call per doubling.
+    let mut bytes = Vec::with_capacity(64 * 1024);
+    crate::file::read(std::path::Path::new("/proc/self/mountinfo"), &mut bytes)
+        .ok()?;
+    let table = std::str::from_utf8(&bytes).ok()?;
     let mut best: Option<&str> = None;
     for line in table.lines() {
         // The mount point is the fifth field, and the fields before it

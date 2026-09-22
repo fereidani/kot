@@ -269,8 +269,12 @@ fn delete(store: &Store, id: &str, force: bool) -> Result<i32> {
     let record = match store.load(id) {
         Ok(record) => record,
         // Removing something that is already gone leaves the caller where it
-        // asked to be.
-        Err(_) if force => return Ok(0),
+        // asked to be, and a record that cannot be read names nothing to
+        // act on. What can still be reached is reached by id below.
+        Err(_) if force => {
+            remove_unreadable(store, id);
+            return Ok(0);
+        }
         Err(e) => return Err(e),
     };
 
@@ -327,6 +331,60 @@ fn delete(store: &Store, id: &str, force: bool) -> Result<i32> {
     store.remove(id)?;
     run_bundle_hooks(&record, HookPoint::PostStop);
     Ok(0)
+}
+
+/// Removes what is left of a container whose record cannot be read.
+///
+/// The id alone still names the cgroup the runtime would have made for it,
+/// so whatever is running in that group is killed and the group removed.
+/// A container the configuration put somewhere else, or under a systemd
+/// scope, is beyond reach without its record; what the record would have
+/// added is listed in `delete` above.
+///
+/// The directory goes last and unconditionally. Leaving it would hold the
+/// id against the next container of that name, with nothing able to explain
+/// why.
+fn remove_unreadable(store: &Store, id: &str) {
+    match crate::cgroup::Manager::new(crate::cgroup::Kind::Cgroupfs, None, id) {
+        Ok(mut manager) => {
+            let mut pids = Vec::new();
+            if manager.processes(&mut pids).is_ok() {
+                for pid in &pids {
+                    let _ = send_signal(*pid, crate::sys::signal::SIGKILL);
+                }
+            }
+            wait_until_empty(&mut manager, &mut pids);
+            if let Err(error) = manager.destroy() {
+                crate::log::warn(&format!(
+                    "removing the cgroup for {id}: {error}"
+                ));
+            }
+        }
+        Err(error) => {
+            crate::log::warn(&format!("reaching the cgroup for {id}: {error}"));
+        }
+    }
+    if let Err(error) = store.remove(id) {
+        crate::log::warn(&format!(
+            "removing the state directory for {id}: {error}"
+        ));
+    }
+}
+
+/// Waits for a cgroup to lose the processes that were just killed.
+///
+/// A group still holding one cannot be removed, and a process sent
+/// `SIGKILL` is there until the kernel has finished with it.
+fn wait_until_empty(manager: &mut crate::cgroup::Manager, pids: &mut Vec<i32>) {
+    // Bounded for the same reason as the wait below.
+    for _ in 0..10_000 {
+        match manager.processes(pids) {
+            Ok(()) if pids.is_empty() => return,
+            Ok(()) => {}
+            Err(_) => return,
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
 }
 
 /// Waits for a killed container to actually be gone.

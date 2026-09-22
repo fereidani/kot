@@ -26,7 +26,6 @@ pub mod record;
 use crate::{
     oci::plan::{
         codec::{Reader, Str, Writer},
-        layout::BoolPad2,
         record::{
             DeviceOp, IdRange, MountOp, NamespaceOp, PathOp, RlimitOp, WriteOp,
         },
@@ -41,7 +40,7 @@ pub const MAGIC: u32 = 0x5054_4f4b;
 ///
 /// Init refuses a plan whose revision it does not know, so a mismatched pair
 /// of binaries cannot misread offsets.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Sections a plan is divided into.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -154,7 +153,13 @@ record! {
         /// namespace is rooted wherever its creator sits at the time, so
         /// making it at the clone would root it in the runtime's own cgroup
         /// and the container would see the wrong tree.
-        cgroup_namespace: BoolPad2,
+        cgroup_namespace: bool,
+        /// Whether the driver runs hooks between the mounts and the pivot,
+        /// which is the only reason for init to wait there.
+        hooks_before_pivot: bool,
+        /// Whether the driver runs hooks between the configuration and the
+        /// payload, likewise.
+        hooks_before_exec: bool,
     }
 }
 

@@ -540,14 +540,20 @@ fn configure(
     // An init that had to fork to enter a pid namespace left the
     // container's process behind it. Signalling the container, reading its
     // state, entering its namespaces: all of them mean that process rather
-    // than the one waiting on it.
-    let payload = payload_process(pid);
+    // than the one waiting on it. Every other container is its own payload,
+    // and the plan says which kind this is, so there is nothing to ask
+    // `/proc`.
+    let payload = if lowered.forks_before_payload() {
+        payload_process(pid)
+    } else {
+        pid
+    };
 
     if lowered.creates_userns && !clone_userns {
         write_id_maps(request, pid, container.deny_setgroups, socket)?;
     }
 
-    settle_cgroup(manager, spec, lowered, socket, pid, in_cgroup)?;
+    settle_cgroup(manager, spec, lowered, socket, payload, in_cgroup)?;
 
     // Cache and bandwidth partitioning is a filesystem of its own rather
     // than part of the cgroup, so it is applied here beside the limits and
@@ -635,6 +641,12 @@ fn finish_filesystem(
     idmaps: &[OwnedFd],
 ) -> Result<()> {
     await_filesystem(request.plan, socket, pid, idmaps)?;
+    // Init waits here only when the plan says hooks run, so the answer is
+    // taken from the plan rather than worked out from the specification a
+    // second time.
+    if !request.plan.container()?.hooks_before_pivot {
+        return Ok(());
+    }
     if let Some(hooks) = request.spec.hooks.as_ref() {
         hooks::run_in_container(
             pid,
@@ -662,7 +674,6 @@ fn release_payload(
         Kind::Prepared,
         "waiting for the container to be prepared",
     )?;
-    sync::send(socket, &Message::new(Kind::Proceed))?;
 
     // A profile with a notify action suspends every matching syscall until an
     // agent answers, so the descriptor has to reach the agent before the
@@ -683,6 +694,9 @@ fn release_payload(
     // A container that is not waiting to be started has no `start` operation
     // to carry its `startContainer` hooks, so they run here, in the last
     // moment before the payload replaces init.
+    // As above: what init waits for is what the plan told it, not what a
+    // second reading of the specification says.
+    let waiting = request.plan.container()?.hooks_before_exec;
     if !request.awaiting_start {
         if let Some(hooks) = request.spec.hooks.as_ref() {
             hooks::run_in_container(
@@ -694,7 +708,11 @@ fn release_payload(
             )?;
         }
     }
-    sync::send(socket, &Message::new(Kind::HooksRun))?;
+    // Init stops here only for hooks the configuration named, whether they
+    // ran now or are left to `start`.
+    if waiting {
+        sync::send(socket, &Message::new(Kind::HooksRun))?;
+    }
     Ok(())
 }
 
@@ -934,7 +952,7 @@ fn settle_cgroup(
     spec: &Spec<'_>,
     lowered: &lower::Lowered,
     socket: BorrowedFd<'_>,
-    pid: i32,
+    payload: i32,
     in_cgroup: bool,
 ) -> Result<()> {
     let resources = resources(spec);
@@ -948,7 +966,7 @@ fn settle_cgroup(
         release_cgroupns(lowered, socket)?;
     } else {
         manager
-            .add_process(payload_process(pid))
+            .add_process(payload)
             .context("moving the container into its cgroup")?;
     }
     manager
@@ -976,8 +994,24 @@ fn release_cgroupns(
     if !lowered.creates_cgroupns {
         return Ok(());
     }
-    sync::send(socket, &Message::new(Kind::CgroupJoined))
-        .context("releasing the container's cgroup namespace")
+    match sync::send(socket, &Message::new(Kind::CgroupJoined)) {
+        Ok(()) => Ok(()),
+        // Init builds the filesystem while this runs, so it can fail and be
+        // gone before it is told. Reporting the write would report the race
+        // rather than the reason: the next read is where init's own message
+        // is waiting, and it says what actually went wrong.
+        Err(e) if gone(&e) => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e)
+            .context("releasing the container's cgroup namespace")),
+    }
+}
+
+/// Whether an error on the socket means init is no longer there.
+fn gone(error: &crate::sys::error::Error) -> bool {
+    matches!(
+        error.errno(),
+        crate::sys::error::EPIPE | crate::sys::error::ECONNRESET
+    )
 }
 
 /// Assembles what the runtime remembers about a container between commands.
@@ -1023,7 +1057,7 @@ fn build_record(
 }
 
 /// Passes the seccomp notify descriptor on, when the profile asked for one.
-fn deliver_seccomp_listener(
+pub(crate) fn deliver_seccomp_listener(
     plan: &View<'_>,
     record: &Record,
     socket: BorrowedFd<'_>,

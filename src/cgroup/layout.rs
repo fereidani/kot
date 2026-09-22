@@ -201,12 +201,26 @@ pub fn ensure_below(relative: &[u8]) -> Result<()> {
 /// relative to it, which is both fewer syscalls and immune to the directory
 /// being moved underneath us.
 pub fn open_or_create(path: &Path) -> Result<OwnedFd> {
-    match open_directory(path) {
-        Ok(fd) => return Ok(fd),
-        Err(e) if e.is_not_found() => {}
-        Err(e) => return Err(e),
+    use rustix::fs::Mode;
+
+    // The leaf is created before anything is looked at. A container's own
+    // cgroup never exists yet and its parents always do, so this is one
+    // call where looking first and then walking the ancestors is six.
+    match rustix::fs::mkdir(path.as_c_str(), Mode::from_raw_mode(0o755)) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == crate::sys::error::EEXIST => {}
+        Err(e) if e.raw_os_error() == crate::sys::error::ENOENT => {
+            create_directories(path)?;
+        }
+        Err(e) => {
+            // A parent that refuses a new directory is not a failure when
+            // the one asked for is already there, which is how a delegated
+            // cgroup arrives.
+            return open_directory(path).map_err(|_| {
+                Error::from(e).describe("cgroup: create directory")
+            });
+        }
     }
-    create_directories(path)?;
     open_directory(path)
 }
 

@@ -278,8 +278,20 @@ pub fn receive_fd(
     let mut buffer = RecvAncillaryBuffer::new(&mut space);
     let mut slices = [std::io::IoSliceMut::new(&mut raw)];
     let received =
-        recvmsg(socket, &mut slices, &mut buffer, RecvFlags::empty())
-            .context("sync: receive descriptor")?;
+        match recvmsg(socket, &mut slices, &mut buffer, RecvFlags::empty()) {
+            Ok(received) => received,
+            // A peer that closed while a message it never read was still in its
+            // queue leaves this end with a reset to report, and the kernel
+            // reports it ahead of anything already received. Reading again is
+            // what reaches that: the first read took the reset away with it.
+            Err(rustix::io::Errno::CONNRESET) => {
+                recvmsg(socket, &mut slices, &mut buffer, RecvFlags::empty())
+                    .context("sync: receive descriptor")?
+            }
+            Err(e) => {
+                return Err(Error::from(e).describe("sync: receive descriptor"));
+            }
+        };
     if received.bytes == 0 {
         return Err(Error::msg("sync: peer closed without reporting"));
     }
@@ -308,8 +320,16 @@ pub fn receive(socket: BorrowedFd<'_>) -> Result<Message> {
     // `TRUNC` asks for the packet's own length, not the part that fitted, so a
     // packet longer than a message is seen for what it is instead of arriving
     // as a whole one.
-    let (_, len) =
-        recv(socket, &mut raw[..], RecvFlags::TRUNC).context("sync: read")?;
+    let (_, len) = match recv(socket, &mut raw[..], RecvFlags::TRUNC) {
+        Ok(answer) => answer,
+        // As in `receive_fd`: the reset is reported ahead of a message that
+        // has already arrived, and reading again reaches the message.
+        Err(rustix::io::Errno::CONNRESET) => {
+            recv(socket, &mut raw[..], RecvFlags::TRUNC)
+                .context("sync: read")?
+        }
+        Err(e) => return Err(Error::from(e).describe("sync: read")),
+    };
     if len == 0 {
         return Err(Error::msg("sync: peer closed without reporting"));
     }

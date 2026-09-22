@@ -22,6 +22,9 @@ const SIG_BLOCK: usize = 0;
 /// `SIG_SETMASK`.
 const SIG_SETMASK: usize = 2;
 
+/// `SIG_IGN`.
+const SIG_IGN: usize = 1;
+
 /// Bytes one `signalfd_siginfo` occupies. The kernel's structure is this
 /// long by definition, and the signal number is its first word.
 pub const SIGINFO_SIZE: usize = 128;
@@ -125,4 +128,43 @@ pub fn drain(fd: BorrowedFd<'_>, mut visit: impl FnMut(u32)) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The kernel's `sigaction`, which is not the structure `libc` exposes under
+/// that name: the mask is a plain word and the restorer is a field of its
+/// own.
+#[repr(C)]
+struct Action {
+    /// `SIG_DFL`, `SIG_IGN`, or a handler, none of which this crate installs.
+    handler: usize,
+    /// `SA_*` flags.
+    flags: usize,
+    /// The trampoline a handler returns through, unused without one.
+    restorer: usize,
+    /// Signals blocked while a handler runs, likewise unused.
+    mask: u64,
+}
+
+/// Sets a signal's disposition to ignoring it.
+pub fn ignore(signal: u32) -> Result<()> {
+    let action = Action {
+        handler: SIG_IGN,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
+    // SAFETY: the pointer refers to an `Action` laid out as the kernel's
+    // structure and outlives the call, the old disposition is not asked for,
+    // and the last argument is the size of the mask above. No handler is
+    // installed, so nothing runs in signal context.
+    let r = unsafe {
+        syscall4(
+            nr::RT_SIGACTION,
+            signal as usize,
+            arg_ref(&action),
+            0,
+            core::mem::size_of::<u64>(),
+        )
+    };
+    ret_unit(r, "rt_sigaction").context("signalfd: ignore")
 }

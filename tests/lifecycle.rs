@@ -203,6 +203,275 @@ fn a_running_container_cannot_be_deleted_without_force() {
     assert!(state(&bundle).is_none());
 }
 
+/// A record the runtime cannot read still names a container.
+///
+/// A state file left empty by a crash, or by a filesystem that lost the
+/// write, gives `delete` nothing to act on. Answering that the container is
+/// gone while its process keeps running and its directory stays behind
+/// holds the id for good and strands the process: the next `create` of that
+/// name is refused by a directory nobody can explain, and nothing is left
+/// that names what is still running.
+#[test]
+fn a_forced_delete_removes_a_record_it_cannot_read() {
+    if !privileged() {
+        return;
+    }
+    let bundle = Bundle::new("delete-unreadable", &["/usr/bin/sleep", "30"]);
+    let id = bundle.id();
+    expect_ok("create", &bundle.runtime(&["create", &id]));
+    expect_ok("start", &bundle.runtime(&["start", &id]));
+    assert!(wait_for_status(&bundle, "running"));
+    let (_, _, pid) = state(&bundle).expect("the container's state");
+
+    let record = std::path::Path::new(&bundle.state_root())
+        .join(&id)
+        .join("state.json");
+    std::fs::write(&record, b"").expect("emptying the state record");
+
+    expect_ok(
+        "forced delete",
+        &bundle.runtime(&["delete", "--force", &id]),
+    );
+    assert!(
+        !record.parent().is_some_and(std::path::Path::exists),
+        "the state directory should be gone with the record"
+    );
+    let cgroup = std::path::PathBuf::from("/sys/fs/cgroup/kot").join(&id);
+    assert!(
+        !cgroup.exists(),
+        "the cgroup should be gone with the record"
+    );
+    assert!(
+        stopped(pid),
+        "the container's process should not outlive its record"
+    );
+    expect_ok("create again", &bundle.runtime(&["create", &id]));
+    bundle.cleanup();
+}
+
+/// Whether a process has stopped running.
+///
+/// A process killed a moment ago is still in `/proc` until whoever waits on
+/// it does, which for a container the runtime has removed is whatever
+/// adopted it. What matters is that it is no longer running.
+fn stopped(pid: i64) -> bool {
+    // Bounded: a killed process reaches this state at once, and the wait is
+    // here only for the moment between the signal and the kernel acting.
+    for _ in 0..1000 {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        else {
+            return true;
+        };
+        // The state follows the command name, which is the one field that
+        // can hold a space and is parenthesised for that reason.
+        let state = stat
+            .rsplit_once(") ")
+            .and_then(|(_, rest)| rest.split_whitespace().next());
+        if state.is_none_or(|state| state == "Z") {
+            return true;
+        }
+        sleep(Duration::from_millis(2));
+    }
+    false
+}
+
+/// A payload is handed three standard descriptors, open or not.
+///
+/// A caller may start the runtime with one of its own closed. Passing that
+/// on gives the payload a free number below three, which the first file it
+/// opens takes: everything it then prints goes into that file instead.
+#[test]
+fn a_payload_is_given_the_null_device_for_a_stream_the_caller_closed() {
+    if !privileged() {
+        return;
+    }
+    let bundle = Bundle::new(
+        "closed-stream",
+        &[
+            "/usr/bin/sh",
+            "-c",
+            // The copy is taken before the redirection claims the
+            // number, so what is read is the descriptor the payload was
+            // started with.
+            "exec 4>&1; readlink /proc/self/fd/4 > /answer.txt",
+        ],
+    );
+    let mut command = std::process::Command::new(bundle::RUNTIME);
+    command
+        .args(["--root", &bundle.state_root(), "run", &bundle.id()])
+        .current_dir(bundle.path())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: the closure calls nothing but `close`, which is
+    // async-signal-safe, and closing standard output is the condition under
+    // test.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+            // SAFETY: the descriptor is this process's own and the child
+            // is about to be executed, so nothing else uses it.
+            rustix::io::close(1);
+            Ok(())
+        });
+    }
+    let status = command.status().expect("running the runtime");
+    assert!(status.success(), "the container should run: {status}");
+
+    let answer =
+        std::fs::read_to_string(bundle.path().join("rootfs/answer.txt"))
+            .expect("the payload wrote nothing");
+    assert_eq!(
+        answer.trim(),
+        "/dev/null",
+        "a closed standard stream should reach the payload as the null device"
+    );
+}
+
+/// Hooks at both container stages release init on the `create` and `start`
+/// path, not only on `run`.
+///
+/// Init stops at each stage only when the plan says hooks run there, and the
+/// driver sends the message that releases it under the same condition. The
+/// two halves disagreeing is a container that never starts.
+#[test]
+fn container_hooks_release_init_on_the_create_and_start_path() {
+    if !privileged() {
+        return;
+    }
+    let bundle = Bundle::new(
+        "staged-hooks",
+        &["/usr/bin/sh", "-c", "echo payload >> /tmp/order.txt"],
+    );
+    let root = bundle.path().to_path_buf();
+    std::fs::create_dir_all(root.join("rootfs/tmp")).expect("a place to write");
+    // A `createContainer` hook is named in the runtime's own namespace and
+    // runs in the container's before the root changes, so both its own
+    // path and the file it writes are the ones outside. A `startContainer`
+    // hook runs after the change, so both of its are inside.
+    let outside = root.join("rootfs/tmp/order.txt");
+    let record = [
+        ("hook.sh", "created", outside.display().to_string()),
+        ("rootfs/hook.sh", "starting", "/tmp/order.txt".to_owned()),
+    ];
+    for (where_, line, file) in record {
+        let path = root.join(where_);
+        let script = format!("#!/bin/sh\necho {line} >> {file}\n");
+        std::fs::write(&path, script).expect("hook");
+        let mut mode = std::fs::metadata(&path).expect("hook").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+        std::fs::set_permissions(&path, mode).expect("hook is executable");
+    }
+
+    let config = root.join("config.json");
+    let text = std::fs::read_to_string(&config).expect("config");
+    let hooks = format!(
+        r#""hooks": {{
+    "createContainer": [{{ "path": "{}/hook.sh" }}],
+    "startContainer": [{{ "path": "/hook.sh" }}]
+  }},
+  "linux": {{"#,
+        root.display()
+    );
+    std::fs::write(&config, text.replacen(r#""linux": {"#, &hooks, 1))
+        .expect("config with hooks");
+
+    let id = bundle.id();
+    expect_ok("create", &bundle.runtime(&["create", &id]));
+    expect_ok("start", &bundle.runtime(&["start", &id]));
+    assert!(wait_for_status(&bundle, "stopped"));
+
+    let order = std::fs::read_to_string(root.join("rootfs/tmp/order.txt"))
+        .expect("nothing ran");
+    let lines: Vec<&str> = order.split_whitespace().collect();
+    assert_eq!(
+        lines,
+        vec!["created", "starting", "payload"],
+        "each stage runs in turn and the payload comes last"
+    );
+}
+
+/// A process `exec` puts in a container gets the same filter, and a filter
+/// that notifies needs its listener delivered like any other.
+///
+/// The container's profile applies to whatever runs inside it. Installing
+/// the filter and leaving the descriptor with the process suspends the first
+/// syscall the profile hands over, with nothing on the other end to answer
+/// it; the runtime instead stops with the two ends of its handshake reading
+/// past each other.
+#[test]
+fn a_notify_filter_reaches_its_agent_for_an_exec_too() {
+    if !privileged() {
+        return;
+    }
+    // A name of its own: another test has an agent of its own, and the two
+    // run at the same time.
+    let socket = std::env::temp_dir()
+        .join(format!("kot-agent-exec-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let listener =
+        std::os::unix::net::UnixListener::bind(&socket).expect("agent socket");
+    let agent = std::thread::spawn(move || {
+        use std::io::Read;
+
+        listener.set_nonblocking(true).expect("agent socket");
+        // Two connections: one for the container, one for the process
+        // `exec` adds to it. Bounded, so a runtime that delivers neither
+        // fails the assertion below rather than holding the suite.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut seen = Vec::new();
+        while seen.len() < 2 && std::time::Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                sleep(Duration::from_millis(20));
+                continue;
+            };
+            stream.set_nonblocking(false).expect("agent connection");
+            let mut payload = String::new();
+            let _ = stream.read_to_string(&mut payload);
+            seen.push(payload);
+        }
+        seen
+    });
+
+    let path = socket.display().to_string();
+    let bundle = Bundle::with_config(
+        "notify-exec",
+        &["/usr/bin/sleep", "30"],
+        |config| {
+            let profile = format!(
+                r#""seccomp": {{
+      "defaultAction": "SCMP_ACT_ALLOW",
+      "listenerPath": "{path}",
+      "syscalls": [
+        {{ "names": ["mkdir"], "action": "SCMP_ACT_NOTIFY" }}
+      ]
+    }},
+    "namespaces": ["#
+            );
+            *config = config.replace(r#""namespaces": ["#, &profile);
+        },
+    );
+    let id = bundle.id();
+    expect_ok("create", &bundle.runtime(&["create", &id]));
+    expect_ok("start", &bundle.runtime(&["start", &id]));
+    assert!(wait_for_status(&bundle, "running"));
+
+    expect_ok("exec", &bundle.runtime(&["exec", &id, "/usr/bin/true"]));
+    bundle.cleanup();
+
+    let seen = agent.join().expect("the agent thread");
+    assert_eq!(
+        seen.len(),
+        2,
+        "the container and the exec both owe the agent a listener"
+    );
+    for payload in &seen {
+        assert!(
+            payload.contains("\"seccompFd\""),
+            "the agent is told which descriptor is the listener, got: {payload}"
+        );
+    }
+    let _ = std::fs::remove_file(&socket);
+}
+
 #[test]
 fn exec_joins_the_running_container() {
     if !privileged() {

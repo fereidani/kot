@@ -167,7 +167,13 @@ fn wait_for_child(pid: i32) -> i32 {
 /// only way to know is to ask again.
 pub fn set_fs_uid(uid: u32) -> Result<()> {
     // SAFETY: the single argument is a scalar.
-    let _ = unsafe { syscall1(nr::SETFSUID, uid as usize) };
+    let previous = unsafe { syscall1(nr::SETFSUID, uid as usize) };
+    // The answer is the id that was in force. Finding the one asked for
+    // settles it without a second call: nothing changed because nothing
+    // had to.
+    if u32::try_from(previous).is_ok_and(|current| current == uid) {
+        return Ok(());
+    }
     // SAFETY: as above. The answer is what the call before it left in
     // place, which is the id now in force.
     let now = unsafe { syscall1(nr::SETFSUID, uid as usize) };
@@ -183,7 +189,10 @@ pub fn set_fs_uid(uid: u32) -> Result<()> {
 /// The same for the group, whose failure is reported the same way.
 pub fn set_fs_gid(gid: u32) -> Result<()> {
     // SAFETY: the single argument is a scalar.
-    let _ = unsafe { syscall1(nr::SETFSGID, gid as usize) };
+    let previous = unsafe { syscall1(nr::SETFSGID, gid as usize) };
+    if u32::try_from(previous).is_ok_and(|current| current == gid) {
+        return Ok(());
+    }
     // SAFETY: as above.
     let now = unsafe { syscall1(nr::SETFSGID, gid as usize) };
     if u32::try_from(now).is_ok_and(|current| current == gid) {

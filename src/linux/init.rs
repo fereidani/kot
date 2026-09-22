@@ -227,7 +227,13 @@ impl Init<'_> {
         // runs the hooks that belong at this point before letting init
         // continue.
         sync::send(self.socket, &Message::new(Kind::Prepared))?;
-        sync::expect(self.socket, Kind::Proceed)?;
+        // An `exec` waits to be let go: its driver still has to put this
+        // process in the container's cgroup and give it its affinity, and
+        // neither could be done before the process existed. A container
+        // being created has had all of that done already.
+        if self.container.join_only {
+            sync::expect(self.socket, Kind::Proceed)?;
+        }
 
         self.finish()
     }
@@ -258,7 +264,6 @@ impl Init<'_> {
         let (plan, container) = (self.plan, &self.container);
         rootfs::prepare(container, plan)?;
 
-        let root = rootfs::open_root(plan, container)?;
         let root_path = plan.c_str(container.rootfs)?;
         let mut resolver = Resolver::new(root_path)?;
 
@@ -326,12 +331,14 @@ impl Init<'_> {
         // root changing. Init cannot run them itself, so it waits while the
         // driver does.
         sync::send(self.socket, &Message::new(Kind::Mounted))?;
-        sync::expect(self.socket, Kind::HooksRun)?;
+        if self.container.hooks_before_pivot {
+            sync::expect(self.socket, Kind::HooksRun)?;
+        }
 
         if container.no_pivot {
-            rootfs::chroot(root.as_fd())?;
+            rootfs::chroot(resolver.root())?;
         } else {
-            rootfs::pivot(root.as_fd())?;
+            rootfs::pivot(resolver.root())?;
         }
         // Now that the container's root is the root, it can be given the
         // propagation the configuration asked for. Doing it before the
@@ -452,7 +459,7 @@ impl Init<'_> {
         sync::send(self.socket, &Message::new(Kind::Configured))?;
         // An `exec` joins a container that is already running, so none of the
         // container's own hook points apply to it and nobody is listening.
-        if !self.container.join_only {
+        if !self.container.join_only && self.container.hooks_before_exec {
             sync::expect(self.socket, Kind::HooksRun)?;
         }
 

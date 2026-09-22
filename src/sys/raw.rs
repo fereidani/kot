@@ -46,6 +46,7 @@ syscall_numbers! {
     MOUNT_SETATTR = "`mount_setattr(2)`", 442, 442;
     PERSONALITY = "`personality(2)`", 135, 92;
     PRCTL = "`prctl(2)`", 157, 167;
+    RT_SIGACTION = "`rt_sigaction(2)`", 13, 134;
     RT_SIGPROCMASK = "`rt_sigprocmask(2)`", 14, 135;
     SCHED_SETAFFINITY = "`sched_setaffinity(2)`", 203, 122;
     SCHED_SETATTR = "`sched_setattr(2)`", 314, 274;

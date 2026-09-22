@@ -187,6 +187,7 @@ errno_table! {
     EOVERFLOW = 75, "value too large for defined data type";
     EOPNOTSUPP = 95, "operation not supported";
     EADDRINUSE = 98, "address already in use";
+    ECONNRESET = 104, "connection reset by peer";
     ETIMEDOUT = 110, "connection timed out";
     ECONNREFUSED = 111, "connection refused";
     ESTALE = 116, "stale file handle";

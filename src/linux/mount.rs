@@ -38,8 +38,9 @@ static MOUNT_API: AtomicU8 = AtomicU8::new(0);
 
 /// True when the kernel supports `fsopen` and friends.
 ///
-/// Probed once with a call that costs a descriptor and tells us definitively,
-/// rather than by reading a version number.
+/// Probed once by calling it, rather than by reading a version number. The
+/// filesystem named has to be one the kernel has: an unknown name sends it
+/// looking for a module, which costs milliseconds and a helper process.
 pub fn has_mount_api() -> bool {
     match MOUNT_API.load(Ordering::Relaxed) {
         1 => return true,
@@ -78,6 +79,11 @@ impl Resolver {
             root,
             cache: Vec::new(),
         })
+    }
+
+    /// The container root every path here is resolved against.
+    pub fn root(&self) -> BorrowedFd<'_> {
+        self.root.as_fd()
     }
 
     /// Forgets the cached descriptor for `path` and everything under it.

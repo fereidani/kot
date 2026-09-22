@@ -107,6 +107,20 @@ pub struct Lowered {
     pub creates_cgroupns: bool,
 }
 
+impl Lowered {
+    /// True when the process the driver cloned is not the one that runs the
+    /// payload.
+    ///
+    /// Init forks to enter a pid namespace, whether it made one after
+    /// unsharing or joined one: either way the kernel puts the caller's
+    /// children in it and never the caller.
+    #[must_use]
+    pub fn forks_before_payload(&self) -> bool {
+        self.forks_after_unshare
+            || self.joins.iter().any(|join| join.flag == CLONE_NEWPID)
+    }
+}
+
 /// Scratch buffers the caller owns and reuses.
 #[derive(Default)]
 pub struct Scratch {
@@ -314,6 +328,17 @@ fn container(
         deny_setgroups: creates_userns,
         join_only: settings.join_only,
         cgroup_namespace: namespaces.cgroup,
+        // Both handshakes exist for the hooks that run between init's steps.
+        // Without any, init would stop for a message the driver sends only
+        // to release it again.
+        hooks_before_pivot: spec
+            .hooks
+            .as_ref()
+            .is_some_and(|h| !h.create_container.is_empty()),
+        hooks_before_exec: spec
+            .hooks
+            .as_ref()
+            .is_some_and(|h| !h.start_container.is_empty()),
     })
 }
 

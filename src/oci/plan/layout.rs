@@ -11,9 +11,6 @@
 //! bytes that keep the field after it at its natural offset. The padding is
 //! written as zero and skipped when read.
 
-/// A `bool` followed by two bytes of padding.
-pub type BoolPad2 = bool;
-
 /// A `u8` followed by three bytes of padding.
 pub type U8Pad3 = u8;
 
@@ -32,7 +29,6 @@ macro_rules! record {
     (@size u64) => { 8 };
     (@size i64) => { 8 };
     (@size Str) => { Str::SIZE };
-    (@size BoolPad2) => { 1 + 2 };
     (@size U8Pad3) => { 1 + 3 };
     (@size U32Pad4) => { 4 + 4 };
     (@size I32Pad4) => { 4 + 4 };
@@ -44,11 +40,6 @@ macro_rules! record {
     (@put $w:ident, u64, $value:expr) => { $w.u64($value) };
     (@put $w:ident, i64, $value:expr) => { $w.i64($value) };
     (@put $w:ident, Str, $value:expr) => { $w.str($value) };
-    (@put $w:ident, BoolPad2, $value:expr) => {{
-        $w.bool($value);
-        $w.u8(0);
-        $w.u8(0);
-    }};
     (@put $w:ident, U8Pad3, $value:expr) => {{
         $w.u8($value);
         $w.u8(0);
@@ -71,12 +62,6 @@ macro_rules! record {
     (@get $r:ident, u64) => { $r.u64()? };
     (@get $r:ident, i64) => { $r.i64()? };
     (@get $r:ident, Str) => { $r.str()? };
-    (@get $r:ident, BoolPad2) => {{
-        let value = $r.bool()?;
-        $r.u8()?;
-        $r.u8()?;
-        value
-    }};
     (@get $r:ident, U8Pad3) => {{
         let value = $r.u8()?;
         $r.u8()?;
