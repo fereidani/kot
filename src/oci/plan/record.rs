@@ -94,8 +94,6 @@ record! {
         propagation: u64,
         /// How the mount is established.
         kind: U8Pad3,
-        /// Index of a prepared source descriptor, or minus one.
-        source_fd: i32,
         /// Index of a user namespace descriptor for an id mapping, or minus
         /// one.
         idmap_fd: i32,

@@ -14,6 +14,9 @@ pub struct Writer {
     /// the next entry needs a separator.
     populated: Vec<bool>,
     indent: usize,
+    /// True when the document is written without newlines, for a stream
+    /// where one document is one line.
+    compact: bool,
 }
 
 impl Default for Writer {
@@ -30,6 +33,20 @@ impl Writer {
             out: String::with_capacity(1024),
             populated: Vec::new(),
             indent: 0,
+            compact: false,
+        }
+    }
+
+    /// A document written on one line.
+    ///
+    /// For a stream a supervisor reads as it arrives: one document per
+    /// line lets it act on each without waiting for a document that only
+    /// ends when the container does.
+    #[must_use]
+    pub fn compact() -> Self {
+        Self {
+            compact: true,
+            ..Self::new()
         }
     }
 
@@ -82,6 +99,18 @@ impl Writer {
         self.quoted(value);
     }
 
+    /// Writes an already-rendered document as the value of a field.
+    ///
+    /// The caller is stating that `document` is well-formed JSON. This
+    /// exists for the one case where a value is a document this runtime
+    /// produced elsewhere: writing it with [`Writer::string`] instead would
+    /// escape it into a string of JSON, which is a different document and
+    /// not the one the reader is expecting.
+    pub fn document(&mut self, key: Option<&str>, document: &str) {
+        self.prefix(key);
+        self.out.push_str(document);
+    }
+
     /// Writes an integer field.
     pub fn number(&mut self, key: Option<&str>, value: i64) {
         self.prefix(key);
@@ -122,7 +151,7 @@ impl Writer {
     }
 
     fn newline(&mut self) {
-        if self.populated.is_empty() {
+        if self.populated.is_empty() || self.compact {
             return;
         }
         self.out.push('\n');

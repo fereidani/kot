@@ -761,3 +761,300 @@ fn a_profile_may_ask_for_tsync_esrch() {
         "both flags should reach the plan"
     );
 }
+
+/// A configuration that names no capabilities is asking for none, so the plan
+/// must still carry sets for init to install.
+///
+/// Leaving the flag clear would skip both the bounding narrowing and the
+/// final `capset`, and a payload running as user zero would keep whatever the
+/// runtime itself held.
+#[test]
+fn absent_capabilities_lower_to_empty_sets() {
+    let text = r#"{
+        "ociVersion": "1.0.0",
+        "process": {
+            "args": ["/true"],
+            "cwd": "/",
+            "user": {"uid": 0, "gid": 0}
+        },
+        "root": {"path": "rootfs"}
+    }"#;
+    let arena = Bump::new();
+    let spec = parse::spec(text.as_bytes(), &arena).expect("parse");
+    let mut scratch = lower::Scratch::new();
+    let lowered = lower::plan(&mut scratch, &spec, &settings()).expect("lower");
+    let view = View::new(&lowered.arena).expect("view");
+    let process = view.process().expect("process");
+
+    assert!(
+        process.has(process_flag::HAS_CAPS),
+        "the sets have to be installed even when none were named"
+    );
+    for set in [
+        process.cap_effective,
+        process.cap_permitted,
+        process.cap_inheritable,
+        process.cap_bounding,
+        process.cap_ambient,
+    ] {
+        assert_eq!(set, 0, "an unnamed set grants nothing");
+    }
+}
+
+/// The opposite case: a configuration that does name capabilities keeps them,
+/// so the empty default cannot be applied unconditionally.
+#[test]
+fn named_capabilities_survive_lowering() {
+    let arena = Bump::new();
+    let spec = parse::spec(MINIMAL.as_bytes(), &arena).expect("parse");
+    let mut scratch = lower::Scratch::new();
+    let lowered = lower::plan(&mut scratch, &spec, &settings()).expect("lower");
+    let view = View::new(&lowered.arena).expect("view");
+    let process = view.process().expect("process");
+
+    assert!(process.has(process_flag::HAS_CAPS));
+    assert_ne!(process.cap_bounding, 0);
+    assert_eq!(process.cap_ambient, 0, "the fixture names an empty set");
+}
+
+/// A capability named on a command line must not build an inheritable set.
+///
+/// The bounding, permitted and effective sets are what let the program use
+/// the capability. The inheritable set decides what happens when that program
+/// later executes a file carrying capabilities of its own, and a set built
+/// here rather than asked for grants privilege that outlives the process
+/// while doing nothing for it.
+#[test]
+fn a_granted_capability_stays_out_of_the_inheritable_set() {
+    let mut capabilities = kot::oci::spec::Capabilities::default();
+    capabilities.grant("CAP_KILL");
+
+    for set in [&capabilities.bounding, &capabilities.permitted] {
+        let set = set.as_ref().expect("the usable sets are granted");
+        assert_eq!(set, &vec!["CAP_KILL"]);
+    }
+    assert!(
+        capabilities.inheritable.is_none(),
+        "nothing asked for inheritance"
+    );
+    assert!(capabilities.ambient.is_none(), "ambient needs inheritable");
+}
+
+/// Where the configuration already inherits, the capability follows.
+///
+/// A process whose configuration carries an inheritable set is asking for
+/// capabilities to survive `execve`, and a capability granted alongside it
+/// that stopped at the permitted set would be lost by the program it was
+/// granted for.
+#[test]
+fn a_granted_capability_follows_an_existing_inheritable_set() {
+    let mut capabilities = kot::oci::spec::Capabilities {
+        inheritable: Some(vec!["CAP_CHOWN"]),
+        ..Default::default()
+    };
+    capabilities.grant("CAP_KILL");
+
+    let inheritable = capabilities.inheritable.expect("inheritable");
+    assert_eq!(inheritable, vec!["CAP_CHOWN", "CAP_KILL"]);
+    let ambient = capabilities.ambient.expect("ambient follows inheritable");
+    assert_eq!(ambient, vec!["CAP_KILL"]);
+}
+
+/// The recursive spelling of the id-mapping option maps the whole tree.
+///
+/// Without it, everything mounted below the source keeps the ownership it
+/// has outside the container, so the mapping the configuration asked for
+/// covers only the top of a volume tree and files under it belong to nobody
+/// the container knows.
+#[test]
+fn the_recursive_idmap_option_maps_submounts_too() {
+    let mount = |option: &str| {
+        let text = format!(
+            r#"{{
+            "ociVersion": "1.0.0",
+            "process": {{"args": ["/true"], "cwd": "/"}},
+            "root": {{"path": "rootfs"}},
+            "mounts": [{{
+                "destination": "/data",
+                "type": "bind",
+                "source": "/var/tmp",
+                "options": ["bind", "{option}"],
+                "uidMappings": [{{"containerID": 0, "hostID": 1000, "size": 1}}],
+                "gidMappings": [{{"containerID": 0, "hostID": 1000, "size": 1}}]
+            }}],
+            "linux": {{"namespaces": [{{"type": "mount"}}]}}
+        }}"#
+        );
+        let arena = Bump::new();
+        let spec = parse::spec(text.as_bytes(), &arena).expect("parse");
+        let mut scratch = lower::Scratch::new();
+        let lowered =
+            lower::plan(&mut scratch, &spec, &settings()).expect("lower");
+        let view = View::new(&lowered.arena).expect("view");
+
+        let mut recursive = false;
+        let mut mapped = false;
+        view.mounts(|op| {
+            if view.text(op.target).unwrap_or("") == "/data" {
+                recursive = op.extra
+                    & kot::oci::plan::record::mount_flag::RECURSIVE
+                    != 0;
+                mapped = op.idmap_fd >= 0;
+            }
+            Ok(())
+        })
+        .expect("walk mounts");
+        (recursive, mapped)
+    };
+
+    assert_eq!(
+        mount("ridmap"),
+        (true, true),
+        "the recursive spelling maps the tree below the source too"
+    );
+    assert_eq!(
+        mount("idmap"),
+        (false, true),
+        "the plain spelling maps only the mount itself"
+    );
+}
+
+/// A user namespace with no mapping stated gets the caller's own identity.
+///
+/// A rootless bundle written by hand usually says only that it wants a user
+/// namespace. Refusing it would turn away the simplest such bundle for a
+/// mapping the runtime can work out, and mapping nothing would leave every
+/// file in the image owned by nobody the container knows.
+#[test]
+fn a_user_namespace_without_mappings_maps_the_caller() {
+    let text = r#"{
+        "ociVersion": "1.0.0",
+        "process": {"args": ["/true"], "cwd": "/"},
+        "root": {"path": "rootfs"},
+        "linux": {"namespaces": [{"type": "mount"}, {"type": "user"}]}
+    }"#;
+    let arena = Bump::new();
+    let spec = parse::spec(text.as_bytes(), &arena).expect("parse");
+    kot::validate::spec(&spec).expect("a bundle like this is accepted");
+
+    let mut scratch = lower::Scratch::new();
+    let lowered = lower::plan(&mut scratch, &spec, &settings()).expect("lower");
+    let view = View::new(&lowered.arena).expect("view");
+
+    assert_eq!(view.count(Section::UidMap), 1, "one derived range");
+    assert_eq!(view.count(Section::GidMap), 1);
+
+    let mut ranges = Vec::new();
+    view.id_map(Section::UidMap, |range| {
+        ranges.push((range.container_id, range.host_id, range.size));
+        Ok(())
+    })
+    .expect("walk the mapping");
+    let (container_id, host_id, size) =
+        ranges.first().copied().expect("a range");
+    assert_eq!(container_id, 0, "the container's own root");
+    assert_eq!(host_id, rustix::process::geteuid().as_raw(), "the caller");
+    assert_eq!(size, 1, "one id, which is all an unprivileged caller has");
+}
+
+/// A mapping the configuration does state is used unchanged.
+#[test]
+fn a_stated_mapping_is_not_replaced() {
+    let text = r#"{
+        "ociVersion": "1.0.0",
+        "process": {"args": ["/true"], "cwd": "/"},
+        "root": {"path": "rootfs"},
+        "linux": {
+            "namespaces": [{"type": "mount"}, {"type": "user"}],
+            "uidMappings": [{"containerID": 0, "hostID": 100000, "size": 65536}],
+            "gidMappings": [{"containerID": 0, "hostID": 100000, "size": 65536}]
+        }
+    }"#;
+    let arena = Bump::new();
+    let spec = parse::spec(text.as_bytes(), &arena).expect("parse");
+    let mut scratch = lower::Scratch::new();
+    let lowered = lower::plan(&mut scratch, &spec, &settings()).expect("lower");
+    let view = View::new(&lowered.arena).expect("view");
+
+    let mut ranges = Vec::new();
+    view.id_map(Section::UidMap, |range| {
+        ranges.push((range.container_id, range.host_id, range.size));
+        Ok(())
+    })
+    .expect("walk the mapping");
+    assert_eq!(ranges, vec![(0, 100_000, 65_536)]);
+}
+
+/// A time namespace is unshared rather than cloned into, and its offsets
+/// travel in the plan.
+///
+/// The kernel fixes a time namespace's clocks the moment a process is in
+/// it, and a process created by a clone carrying the flag is already
+/// inside. Only `unshare` leaves a moment to set them, so the flag must not
+/// reach the clone, and init needs the offsets where it can read them
+/// without the configuration.
+#[test]
+fn a_time_namespace_is_unshared_with_its_offsets() {
+    use kot::sys::clone::CLONE_NEWTIME;
+
+    let text = r#"{
+        "ociVersion": "1.0.0",
+        "process": {"args": ["/true"], "cwd": "/"},
+        "root": {"path": "rootfs"},
+        "linux": {
+            "namespaces": [{"type": "mount"}, {"type": "time"}],
+            "timeOffsets": {
+                "boottime": {"secs": -60, "nanosecs": 500},
+                "monotonic": {"secs": 120}
+            }
+        }
+    }"#;
+    let arena = Bump::new();
+    let spec = parse::spec(text.as_bytes(), &arena).expect("parse");
+    let mut scratch = lower::Scratch::new();
+    let lowered = lower::plan(&mut scratch, &spec, &settings()).expect("lower");
+    let view = View::new(&lowered.arena).expect("view");
+    let container = view.container().expect("container");
+
+    assert_eq!(
+        container.clone_flags & CLONE_NEWTIME,
+        0,
+        "a clone carrying the flag lands inside, too late to set the clocks"
+    );
+    assert_ne!(
+        container.unshare_flags & CLONE_NEWTIME,
+        0,
+        "unsharing leaves init outside, which is where it can set them"
+    );
+    assert!(
+        lowered.forks_after_unshare,
+        "the container reaches the namespace through the fork that follows"
+    );
+
+    assert!(container.set_boottime);
+    assert_eq!(container.boottime_secs, -60, "an offset may go backwards");
+    assert_eq!(container.boottime_nanos, 500);
+    assert!(container.set_monotonic);
+    assert_eq!(container.monotonic_secs, 120);
+    assert_eq!(container.monotonic_nanos, 0);
+}
+
+/// A container that asks for no offsets says so, which zero cannot.
+#[test]
+fn a_time_namespace_without_offsets_sets_no_clock() {
+    let text = r#"{
+        "ociVersion": "1.0.0",
+        "process": {"args": ["/true"], "cwd": "/"},
+        "root": {"path": "rootfs"},
+        "linux": {"namespaces": [{"type": "mount"}, {"type": "time"}]}
+    }"#;
+    let arena = Bump::new();
+    let spec = parse::spec(text.as_bytes(), &arena).expect("parse");
+    let mut scratch = lower::Scratch::new();
+    let lowered = lower::plan(&mut scratch, &spec, &settings()).expect("lower");
+    let view = View::new(&lowered.arena).expect("view");
+    let container = view.container().expect("container");
+
+    assert!(!container.set_boottime);
+    assert!(!container.set_monotonic);
+}

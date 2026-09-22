@@ -53,10 +53,15 @@ pub fn spec(spec: &Spec<'_>) -> Result<()> {
         );
     }
 
+    check_mount_namespace(spec.linux.as_ref())?;
+    check_uts_namespace(spec)?;
+
     let Some(linux) = spec.linux.as_ref() else {
         return Ok(());
     };
     check_namespaces(linux)?;
+    check_time_offsets(linux)?;
+    check_unimplemented(linux)?;
     check_id_maps(linux)?;
     check_seccomp(linux)?;
     Ok(())
@@ -146,6 +151,54 @@ fn check_version(version: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuses a configuration that builds a root filesystem with no mount
+/// namespace to build it in.
+///
+/// The runtime installs the configured mounts and then changes the root, both
+/// in whatever mount namespace it was handed. Without a private one that is
+/// the caller's own: the mounts, their propagation and the detached old root
+/// all land outside the container, and processes that never asked to be in a
+/// container see them. A configuration that joins an existing mount namespace
+/// by path has said where the work belongs, so only the absent case is
+/// refused.
+fn check_mount_namespace(linux: Option<&spec::Linux<'_>>) -> Result<()> {
+    let present = linux.is_some_and(|linux| {
+        linux.namespaces.iter().any(|n| n.kind == "mount")
+    });
+    ensure!(
+        present,
+        "config.json asks for no mount namespace; the configured mounts and \
+         the change of root would be made in the caller's own namespace"
+    );
+    Ok(())
+}
+
+/// Refuses a name for a machine the container does not have.
+///
+/// `hostname` and `domainname` are set with `sethostname` and
+/// `setdomainname`, which act on the UTS namespace the process is in. Without
+/// a private one that is the caller's, so a container asking to be called
+/// something would rename the host, and every process on it would see the new
+/// name. There is no way to honour the field for this container alone, and
+/// renaming the host is not what was asked for.
+fn check_uts_namespace(spec: &Spec<'_>) -> Result<()> {
+    let named = spec.hostname.is_some_and(|name| !name.is_empty())
+        || spec.domainname.is_some_and(|name| !name.is_empty());
+    if !named {
+        return Ok(());
+    }
+    let present = spec
+        .linux
+        .as_ref()
+        .is_some_and(|linux| linux.namespaces.iter().any(|n| n.kind == "uts"));
+    ensure!(
+        present,
+        "config.json names the container but asks for no UTS namespace; \
+         setting it would rename the host instead"
+    );
+    Ok(())
+}
+
 fn check_namespaces(linux: &spec::Linux<'_>) -> Result<()> {
     let mut seen: Vec<&str> = Vec::with_capacity(linux.namespaces.len());
     for namespace in &linux.namespaces {
@@ -160,6 +213,55 @@ fn check_namespaces(linux: &spec::Linux<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Refuses a section this build does not carry.
+///
+/// `features` reports these as unavailable, and a caller that checked will
+/// not send them. One that did not send them anyway, and a container that
+/// started regardless would run without the interface it was supposed to be
+/// given: the payload would bind to whatever interface it found instead,
+/// which is the host's. Refusing is what the report already promises.
+fn check_unimplemented(linux: &spec::Linux<'_>) -> Result<()> {
+    ensure!(
+        linux.net_devices.is_empty(),
+        "linux.netDevices moves host interfaces into the container, which \
+         this runtime does not implement; `kot features` reports it as \
+         unavailable"
+    );
+    Ok(())
+}
+
+/// Refuses clock offsets with nowhere to apply them.
+///
+/// The offsets are set on a time namespace while it still holds the single
+/// process that was put there, so they need one this runtime created. Joining
+/// somebody else's is too late: it already has processes reading its clocks,
+/// and the kernel refuses the write.
+///
+/// The file names two clocks and no others, so a third is a configuration
+/// error worth reporting here rather than as a rejected write halfway through
+/// building the container.
+fn check_time_offsets(linux: &spec::Linux<'_>) -> Result<()> {
+    if linux.time_offsets.is_empty() {
+        return Ok(());
+    }
+    let created = linux
+        .namespaces
+        .iter()
+        .any(|n| n.kind == "time" && n.path.is_none());
+    ensure!(
+        created,
+        "linux.timeOffsets needs a time namespace of this container's own"
+    );
+    for (clock, _) in &linux.time_offsets {
+        ensure!(
+            matches!(*clock, "monotonic" | "boottime"),
+            "linux.timeOffsets names {clock}, which is not a clock the \
+             kernel offsets"
+        );
+    }
+    Ok(())
+}
+
 fn check_id_maps(linux: &spec::Linux<'_>) -> Result<()> {
     let creates_userns = linux
         .namespaces
@@ -168,14 +270,9 @@ fn check_id_maps(linux: &spec::Linux<'_>) -> Result<()> {
     if !creates_userns {
         return Ok(());
     }
-    ensure!(
-        !linux.uid_mappings.is_empty(),
-        "a user namespace needs linux.uidMappings"
-    );
-    ensure!(
-        !linux.gid_mappings.is_empty(),
-        "a user namespace needs linux.gidMappings"
-    );
+    // A configuration that names no mapping is not refused: the lowering
+    // derives the caller's own identity, which is what such a bundle asks for.
+    // A mapping that is stated, though, has to be usable.
     for mapping in linux.uid_mappings.iter().chain(&linux.gid_mappings) {
         ensure!(mapping.size > 0, "an id mapping range has a size of zero");
     }

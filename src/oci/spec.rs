@@ -109,6 +109,36 @@ pub struct Capabilities<'a> {
     pub ambient: Option<Vec<&'a str>>,
 }
 
+impl<'a> Capabilities<'a> {
+    /// Grants one capability named on a command line.
+    ///
+    /// The capability goes into the bounding, permitted and effective sets,
+    /// which is what lets the program use it. It reaches the inheritable and
+    /// ambient sets only where the configuration already asks for
+    /// inheritance. A capability survives `execve` for an unprivileged
+    /// program through the ambient set, and the kernel admits one there only
+    /// when it is already in both the permitted and the inheritable set, so
+    /// the two go together or not at all. Adding to the inheritable set
+    /// alone would grant nothing on its own while still changing what
+    /// happens when the program later executes a file carrying capabilities,
+    /// which is more privilege than was asked for and in the one direction
+    /// that outlives the process.
+    pub fn grant(&mut self, name: &'a str) {
+        let inherits =
+            self.inheritable.as_ref().is_some_and(|set| !set.is_empty());
+        for set in
+            [&mut self.bounding, &mut self.permitted, &mut self.effective]
+        {
+            set.get_or_insert_with(Vec::new).push(name);
+        }
+        if inherits {
+            for set in [&mut self.inheritable, &mut self.ambient] {
+                set.get_or_insert_with(Vec::new).push(name);
+            }
+        }
+    }
+}
+
 /// One resource limit.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Rlimit<'a> {
@@ -358,6 +388,35 @@ pub struct Resources<'a> {
     pub unified: Vec<(&'a str, &'a str)>,
 }
 
+impl Resources<'_> {
+    /// Whether the section asks for anything a cgroup would have to enforce.
+    ///
+    /// Every field here is a limit or a rule that only a cgroup can apply.
+    /// A caller that turned cgroup management off and still stated one is
+    /// asking for something that cannot be done, and the answer to that is
+    /// to say so rather than to start a container with none of the
+    /// isolation the configuration describes.
+    /// A section that is present but states nothing does not count. Tooling
+    /// writes `"memory": {}` where a template had a place for limits and the
+    /// caller set none, and a container refused for that would be refused
+    /// for punctuation.
+    #[must_use]
+    pub fn are_requested(&self) -> bool {
+        let memory = self.memory.as_ref().is_some_and(Memory::is_set);
+        let cpu = self.cpu.as_ref().is_some_and(Cpu::is_set);
+        let block_io = self.block_io.as_ref().is_some_and(BlockIo::is_set);
+        !self.devices.is_empty()
+            || memory
+            || cpu
+            || block_io
+            || self.pids_limit.is_some()
+            || !self.hugepage_limits.is_empty()
+            || self.network.is_some()
+            || !self.rdma.is_empty()
+            || !self.unified.is_empty()
+    }
+}
+
 /// One device access rule.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct DeviceRule<'a> {
@@ -532,4 +591,49 @@ pub struct SyscallArg<'a> {
     pub value_two: u64,
     /// Comparison operator.
     pub op: &'a str,
+}
+
+impl Memory {
+    /// Whether the section states any limit at all.
+    #[must_use]
+    pub const fn is_set(&self) -> bool {
+        self.limit.is_some()
+            || self.reservation.is_some()
+            || self.swap.is_some()
+            || self.kernel.is_some()
+            || self.kernel_tcp.is_some()
+            || self.swappiness.is_some()
+            || self.disable_oom_killer.is_some()
+            || self.use_hierarchy.is_some()
+    }
+}
+
+impl Cpu<'_> {
+    /// Whether the section states any limit at all.
+    #[must_use]
+    pub const fn is_set(&self) -> bool {
+        self.shares.is_some()
+            || self.quota.is_some()
+            || self.burst.is_some()
+            || self.period.is_some()
+            || self.realtime_runtime.is_some()
+            || self.realtime_period.is_some()
+            || self.cpus.is_some()
+            || self.mems.is_some()
+            || self.idle.is_some()
+    }
+}
+
+impl BlockIo {
+    /// Whether the section states any limit at all.
+    #[must_use]
+    pub fn is_set(&self) -> bool {
+        self.weight.is_some()
+            || self.leaf_weight.is_some()
+            || !self.weight_device.is_empty()
+            || !self.throttle_read_bps.is_empty()
+            || !self.throttle_write_bps.is_empty()
+            || !self.throttle_read_iops.is_empty()
+            || !self.throttle_write_iops.is_empty()
+    }
 }

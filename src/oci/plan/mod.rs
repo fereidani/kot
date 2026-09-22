@@ -134,6 +134,19 @@ record! {
         /// What `exec` needs: the container already exists, so there is
         /// nothing to mount and nothing to pivot into.
         join_only: bool,
+        /// Offset applied to the boot-time clock, in whole seconds.
+        boottime_secs: i64,
+        /// Offset applied to the monotonic clock, in whole seconds.
+        monotonic_secs: i64,
+        /// Additional nanoseconds on the boot-time offset.
+        boottime_nanos: u32,
+        /// Additional nanoseconds on the monotonic offset.
+        monotonic_nanos: u32,
+        /// Whether the boot-time clock is offset at all, which zero cannot
+        /// say on its own: a configuration may ask for exactly no offset.
+        set_boottime: bool,
+        /// Whether the monotonic clock is offset at all.
+        set_monotonic: bool,
         /// Make a cgroup namespace, after the driver has moved init into the
         /// container's cgroup.
         ///

@@ -30,6 +30,7 @@ macro_rules! record {
     (@size u32) => { 4 };
     (@size i32) => { 4 };
     (@size u64) => { 8 };
+    (@size i64) => { 8 };
     (@size Str) => { Str::SIZE };
     (@size BoolPad2) => { 1 + 2 };
     (@size U8Pad3) => { 1 + 3 };
@@ -41,6 +42,7 @@ macro_rules! record {
     (@put $w:ident, u32, $value:expr) => { $w.u32($value) };
     (@put $w:ident, i32, $value:expr) => { $w.i32($value) };
     (@put $w:ident, u64, $value:expr) => { $w.u64($value) };
+    (@put $w:ident, i64, $value:expr) => { $w.i64($value) };
     (@put $w:ident, Str, $value:expr) => { $w.str($value) };
     (@put $w:ident, BoolPad2, $value:expr) => {{
         $w.bool($value);
@@ -67,6 +69,7 @@ macro_rules! record {
     (@get $r:ident, u32) => { $r.u32()? };
     (@get $r:ident, i32) => { $r.i32()? };
     (@get $r:ident, u64) => { $r.u64()? };
+    (@get $r:ident, i64) => { $r.i64()? };
     (@get $r:ident, Str) => { $r.str()? };
     (@get $r:ident, BoolPad2) => {{
         let value = $r.bool()?;

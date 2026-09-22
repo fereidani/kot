@@ -82,7 +82,6 @@ pub fn mount(
         attr_clr: options.attr_clear,
         propagation: options.propagation,
         kind: 0,
-        source_fd: -1,
         idmap_fd: -1,
         extra: options.extra,
     };

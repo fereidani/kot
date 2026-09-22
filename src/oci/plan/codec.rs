@@ -104,6 +104,14 @@ impl Writer {
         self.buf.extend_from_slice(&value.to_le_bytes());
     }
 
+    /// Appends a 64-bit signed value.
+    ///
+    /// Signed because a clock offset can move a clock backwards as well as
+    /// forwards.
+    pub fn i64(&mut self, value: i64) {
+        self.buf.extend_from_slice(&value.to_le_bytes());
+    }
+
     /// Appends a string reference.
     pub fn str(&mut self, value: Str) {
         self.u32(value.at);
@@ -189,6 +197,13 @@ impl<'a> Reader<'a> {
         let mut raw = [0u8; 8];
         raw.copy_from_slice(self.take(8)?);
         Ok(u64::from_le_bytes(raw))
+    }
+
+    /// Reads a 64-bit signed value.
+    pub fn i64(&mut self) -> Result<i64> {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(self.take(8)?);
+        Ok(i64::from_le_bytes(raw))
     }
 
     /// Reads a string reference.

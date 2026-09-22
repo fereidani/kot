@@ -253,18 +253,34 @@ fn structural_mount_option(name: &str) -> Effect {
         // The mapping itself is carried by the mount's own `uidMappings` and
         // `gidMappings`, so the option is only a marker.
         "idmap" => Effect::Ignore,
+        // The recursive spelling maps everything mounted below the source as
+        // well. Without it, a volume tree's submounts keep the ids they had
+        // outside the container, so files under them are owned by nobody the
+        // container knows and the mapping the configuration asked for covers
+        // only the top of the tree. It is named here rather than reached by
+        // stripping the prefix, because the marker it is built on has no
+        // effect of its own to make recursive.
+        "ridmap" => Effect::Extra(mount_flag::RECURSIVE),
         _ => Effect::Data,
     }
 }
 
 /// Resolves a propagation mode named by `rootfsPropagation`.
+///
+/// The `r` spellings apply to the whole tree and the plain ones to the root
+/// alone, as they do for a mount option, so the two are not the same request
+/// and are not folded together.
 #[must_use]
 pub fn propagation(name: &str) -> Option<u64> {
     match name {
-        "private" | "rprivate" => Some(ms::PRIVATE),
-        "slave" | "rslave" => Some(ms::SLAVE),
-        "shared" | "rshared" => Some(ms::SHARED),
-        "unbindable" | "runbindable" => Some(ms::UNBINDABLE),
+        "private" => Some(ms::PRIVATE),
+        "rprivate" => Some(ms::PRIVATE | ms::REC),
+        "slave" => Some(ms::SLAVE),
+        "rslave" => Some(ms::SLAVE | ms::REC),
+        "shared" => Some(ms::SHARED),
+        "rshared" => Some(ms::SHARED | ms::REC),
+        "unbindable" => Some(ms::UNBINDABLE),
+        "runbindable" => Some(ms::UNBINDABLE | ms::REC),
         _ => None,
     }
 }

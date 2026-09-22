@@ -24,7 +24,10 @@ use crate::{
     seccomp::Compiler,
     sys::{
         caps::CapSets,
-        clone::{CLONE_NEWCGROUP, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER},
+        clone::{
+            CLONE_NEWCGROUP, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWTIME,
+            CLONE_NEWUSER,
+        },
         error::{Error, Result},
     },
 };
@@ -204,16 +207,29 @@ fn namespaces(
     let cgroup = created & CLONE_NEWCGROUP != 0;
     created &= !CLONE_NEWCGROUP;
 
+    // A time namespace is taken out too, and for a sharper reason: its
+    // clocks can only be set while nothing is in it, and a process created
+    // by a clone that carries the flag is already inside. `unshare` is the
+    // only way in that leaves a moment to set them, and it puts the
+    // caller's children in the namespace rather than the caller, so init
+    // unshares it, writes the offsets, and forks.
+    let time = created & CLONE_NEWTIME;
+    created &= !CLONE_NEWTIME;
+
     let joins_user = joined.iter().any(|j| j.flag == CLONE_NEWUSER);
     let (clone_flags, unshare_flags) = if joins_user {
         (0, created)
     } else {
         (created, 0)
     };
+    let unshare_flags = unshare_flags | time;
 
     out.creates_userns = created & CLONE_NEWUSER != 0;
     out.creates_cgroupns = cgroup;
-    out.forks_after_unshare = unshare_flags & CLONE_NEWPID != 0;
+    // Either of these leaves init outside the namespace it just made, so a
+    // fork is what puts the container in it.
+    out.forks_after_unshare =
+        unshare_flags & (CLONE_NEWPID | CLONE_NEWTIME) != 0;
 
     // A joined namespace is entered in a fixed order: the user namespace
     // first, because it decides what the rest are allowed to do, and the mount
@@ -260,8 +276,29 @@ fn container(
     let creates_userns = namespaces.clone_flags & CLONE_NEWUSER != 0
         || namespaces.unshare_flags & CLONE_NEWUSER != 0;
 
+    // The clocks the configuration shifts, carried in the plan because the
+    // only moment they can be set is inside init, between unsharing the
+    // namespace and forking into it.
+    let offset = |name: &str| {
+        linux.and_then(|linux| {
+            linux
+                .time_offsets
+                .iter()
+                .find(|(clock, _)| *clock == name)
+                .map(|(_, offset)| *offset)
+        })
+    };
+    let boottime = offset("boottime");
+    let monotonic = offset("monotonic");
+
     Ok(Container {
         clone_flags: namespaces.clone_flags,
+        set_boottime: boottime.is_some(),
+        boottime_secs: boottime.map_or(0, |o| o.secs),
+        boottime_nanos: boottime.map_or(0, |o| o.nanosecs),
+        set_monotonic: monotonic.is_some(),
+        monotonic_secs: monotonic.map_or(0, |o| o.secs),
+        monotonic_nanos: monotonic.map_or(0, |o| o.nanosecs),
         unshare_flags: namespaces.unshare_flags,
         rootfs: builder.intern(&settings.rootfs)?,
         rootfs_readonly: spec.root.as_ref().is_some_and(|r| r.readonly),
@@ -286,7 +323,11 @@ fn process(
     settings: &Settings,
 ) -> Result<Process> {
     let Some(source) = spec.process.as_ref() else {
-        return Ok(Process::default());
+        // Nothing was asked for, so nothing is granted: the empty sets are
+        // still installed rather than left to the runtime's own privilege.
+        let mut out = Process::default();
+        out.set(process_flag::HAS_CAPS, true);
+        return Ok(out);
     };
     let mut out = Process {
         uid: source.user.uid,
@@ -319,6 +360,11 @@ fn process(
             .map_err(|_| Error::msg("oomScoreAdj: out of range"))?;
         out.set(process_flag::HAS_OOM_SCORE_ADJ, true);
     }
+    // Capability sets are always installed, even when the configuration names
+    // none. A payload running as user zero inherits whatever the runtime
+    // holds otherwise, which is the opposite of what an absent section asks
+    // for: no capabilities were requested, so none are kept.
+    out.set(process_flag::HAS_CAPS, true);
     if let Some(capabilities) = source.capabilities.as_ref() {
         let sets = capability_sets(capabilities)?;
         out.cap_effective = sets.effective;
@@ -326,7 +372,6 @@ fn process(
         out.cap_inheritable = sets.inheritable;
         out.cap_bounding = sets.bounding;
         out.cap_ambient = sets.ambient;
-        out.set(process_flag::HAS_CAPS, true);
     }
     out.apparmor = builder.intern(source.apparmor_profile.unwrap_or(""))?;
     out.selinux = builder.intern(source.selinux_label.unwrap_or(""))?;
@@ -618,14 +663,41 @@ fn write_id_maps(
     let empty = Vec::new();
     let (uid, gid) =
         linux.map_or((&empty, &empty), |l| (&l.uid_mappings, &l.gid_mappings));
-    if out.creates_userns && uid.is_empty() && gid.is_empty() {
-        return Err(Error::msg(
-            "user namespace: uidMappings and gidMappings are required",
-        ));
-    }
+
+    // A configuration that makes a user namespace and names no mapping is
+    // asking for the caller's own identity inside it, which is what a
+    // rootless bundle written by hand almost always means. Refusing would
+    // turn the simplest such bundle away for a mapping the runtime can
+    // work out; mapping nothing at all would leave every file in the image
+    // owned by nobody the container knows.
+    let derived;
+    let uid = if out.creates_userns && uid.is_empty() {
+        derived = [own_range(rustix::process::geteuid().as_raw())];
+        &derived[..]
+    } else {
+        uid
+    };
+    let derived_gid;
+    let gid = if out.creates_userns && gid.is_empty() {
+        derived_gid = [own_range(rustix::process::getegid().as_raw())];
+        &derived_gid[..]
+    } else {
+        gid
+    };
+
     write_ranges(builder, Section::UidMap, uid)?;
     write_ranges(builder, Section::GidMap, gid)?;
     Ok(())
+}
+
+/// The mapping a container gets when the configuration names none: the
+/// caller's own id, and nothing else.
+fn own_range(id: u32) -> spec::IdMapping {
+    spec::IdMapping {
+        container_id: 0,
+        host_id: id,
+        size: 1,
+    }
 }
 
 fn write_ranges(

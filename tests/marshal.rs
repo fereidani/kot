@@ -125,3 +125,56 @@ fn a_zero_alignment_is_not_a_division() {
     assert!(reader.align(1).is_ok(), "aligning to one is nothing too");
     assert_eq!(reader.u32().ok(), Some(2), "and it still keeps it");
 }
+
+/// A document nested inside another stays a document.
+///
+/// The seccomp notify payload carries the container's state as an object.
+/// Writing it as a string would produce a different document: the reader
+/// would find text where the specification says there is a structure, and
+/// the agent that cannot parse it leaves every handed-over syscall waiting.
+#[test]
+fn a_nested_document_is_not_escaped_into_a_string() {
+    let mut inner = kot::json::Writer::new();
+    inner.object(None);
+    inner.string(Some("id"), "abc");
+    inner.number(Some("pid"), 42);
+    inner.end_object();
+    let inner = inner.finish();
+
+    let mut outer = kot::json::Writer::new();
+    outer.object(None);
+    outer.string(Some("metadata"), "");
+    outer.document(Some("state"), &inner);
+    outer.end_object();
+    let text = outer.finish();
+
+    assert!(
+        !text.contains("\\\""),
+        "a nested document must not be escaped, got: {text}"
+    );
+
+    // It has to parse back as a structure, which is the property the agent
+    // depends on. The parser walks it rather than a substring search saying
+    // the text merely looks right.
+    let arena = bumpalo::Bump::new();
+    let mut parser = kot::oci::json::Parser::new(text.as_bytes(), &arena);
+    let mut found: Option<String> = None;
+    parser.enter_object().expect("the payload is an object");
+    while let Some(key) = parser.next_key().expect("a key") {
+        if key != "state" {
+            parser.skip_value().expect("skipping a value");
+            continue;
+        }
+        parser
+            .enter_object()
+            .expect("the state is an object, not text");
+        while let Some(field) = parser.next_key().expect("a key") {
+            if field == "id" {
+                found = Some(parser.string().expect("a string").to_owned());
+            } else {
+                parser.skip_value().expect("skipping a value");
+            }
+        }
+    }
+    assert_eq!(found.as_deref(), Some("abc"));
+}
