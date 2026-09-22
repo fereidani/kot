@@ -7,6 +7,10 @@ Each RUNTIME is a name to look up on PATH or a path to a binary; the default
 is runc, crun and kot. Runtimes take turns, so a machine that drifts over the
 run drifts for all of them. Needs root: every measured run makes a container.
 
+A runtime that fails a run is left out of the results altogether and said so
+on standard error. A time for a runtime that could not always start a
+container is not one worth comparing, and a row for it would say that it was.
+
 The filter column is the one cost inside the container that belongs to the
 runtime: the seccomp program it compiled, charged to every syscall the
 payload makes. It is a syscall-heavy payload timed with the profile and
@@ -17,6 +21,7 @@ installing the filter is counted.
 import argparse
 import json
 import os
+import platform
 import shutil
 import statistics
 import sys
@@ -28,9 +33,6 @@ BINDS = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"]
 CGROUP = "/sys/fs/cgroup"
 HEADERS = [
     "runtime",
-    "runs",
-    "failed",
-    "mean ms",
     "median ms",
     "min ms",
     "max ms",
@@ -218,10 +220,44 @@ def benchmark(runtimes, runs, warmup, payload, syscalls, work):
                 elif index >= warmup:
                     runtime["samples"][name].append(elapsed)
 
+    qualified = disqualify(runtimes, (warmup + runs) * len(stages))
     for index in range(max(3, runs // 5)):
-        for runtime in runtimes:
+        for runtime in qualified:
             os.chdir(runtime["bundle"])
             runtime["memory"].append(measured_run(runtime, f"mem-{index}"))
+    return qualified
+
+
+def disqualify(runtimes, attempts):
+    """Drops every runtime that failed a run, saying so."""
+    kept = []
+    for runtime in runtimes:
+        if runtime["failed"]:
+            print(
+                f"{runtime['name']}: {runtime['failed']} of {attempts} runs "
+                "failed, so it is left out",
+                file=sys.stderr,
+            )
+        else:
+            kept.append(runtime)
+    return kept
+
+
+def cpu_model():
+    """The processor's own name for itself.
+
+    It says more about the numbers than the host's name does, and it is what
+    the kernel reports, so nothing has to be typed in.
+    """
+    try:
+        with open("/proc/cpuinfo") as info:
+            for line in info:
+                key, separator, value = line.partition(":")
+                if separator and key.strip() in ("model name", "cpu model"):
+                    return " ".join(value.split())
+    except OSError:
+        pass
+    return platform.machine() or "unknown cpu"
 
 
 def filter_cost(runtime, syscalls):
@@ -241,9 +277,6 @@ def row(runtime, syscalls):
     cost = filter_cost(runtime, syscalls)
     return [
         runtime["name"],
-        str(len(times)),
-        str(runtime["failed"]),
-        f"{statistics.mean(times):.1f}" if times else "-",
         f"{statistics.median(times):.1f}" if times else "-",
         f"{min(times):.1f}" if times else "-",
         f"{max(times):.1f}" if times else "-",
@@ -272,7 +305,7 @@ def markdown(runtimes, rows, runs, payload, syscalls):
     lines = [
         "# OCI runtime benchmark",
         "",
-        f"- host: {system.nodename}, {system.sysname} {system.release}",
+        f"- cpu: {cpu_model()}, {system.sysname} {system.release}",
         f"- payload: `{' '.join(payload)}`",
         f"- runs per runtime: {runs}",
         f"- filter column: nanoseconds per syscall over {syscalls} syscalls",
@@ -319,7 +352,7 @@ def main():
     here = os.getcwd()
     with tempfile.TemporaryDirectory(prefix="bench-") as work:
         try:
-            benchmark(
+            runtimes = benchmark(
                 runtimes,
                 options.runs,
                 options.warmup,
@@ -330,7 +363,9 @@ def main():
         finally:
             os.chdir(here)
 
-    runtimes.sort(key=lambda r: statistics.mean(r["times"] or [float("inf")]))
+    if not runtimes:
+        sys.exit("every runtime failed a run")
+    runtimes.sort(key=lambda r: statistics.median(r["times"] or [float("inf")]))
     rows = [row(runtime, options.syscalls) for runtime in runtimes]
     print(table(rows))
     with open(options.out, "w") as out:
