@@ -2406,3 +2406,36 @@ fn an_empty_program_name_is_not_found() {
         "the failure should say the payload was not found: {text}"
     );
 }
+
+/// so the attribute belongs after everything below it exists.
+#[test]
+fn a_read_only_mount_takes_the_mounts_that_go_inside_it() {
+    if !privileged() {
+        return;
+    }
+    let bundle = Bundle::with_config(
+        "read-only-dev",
+        &[
+            "/usr/bin/sh",
+            "-c",
+            "grep ' /dev ' /proc/self/mountinfo | cut -d' ' -f6; \
+             grep -c ' /dev/pts ' /proc/self/mountinfo",
+        ],
+        |config| {
+            *config = config.replace(
+                r#""options": ["nosuid", "strictatime", "mode=755", "size=65536k"]"#,
+                r#""options": ["nosuid", "strictatime", "mode=755", "size=65536k", "ro"]"#,
+            );
+        },
+    );
+
+    let output = bundle.runtime(&["run", &bundle.id()]);
+    expect_ok("run", &output);
+    let text = stdout(&output);
+    let mut lines = text.lines();
+    assert!(
+        lines.next().is_some_and(|flags| flags.starts_with("ro")),
+        "/dev should be read only: {text}"
+    );
+    assert_eq!(lines.next(), Some("1"), "/dev/pts should be mounted");
+}

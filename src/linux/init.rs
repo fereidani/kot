@@ -359,6 +359,9 @@ impl Init<'_> {
             self.enter_cgroup_namespace(&cgroup_joined)?;
         }
         rootfs::create_devices(plan, &mut resolver, self.socket)?;
+        // Last, because a read-only mount takes nothing inside it, and both
+        // the mounts above and the devices just made go inside one.
+        mount::seal_read_only(plan, &mut resolver)?;
 
         // The hooks that run inside the container but still resolve their own
         // paths on the host belong here, between the mounts existing and the

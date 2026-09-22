@@ -753,8 +753,10 @@ fn create_filesystem(plan: &View<'_>, op: &MountOp) -> Result<OwnedFd> {
     // `fsmount` takes every attribute a new mount can carry, so the only
     // thing left for `mount_setattr` is an id mapping. A fresh superblock
     // has no attributes to clear, which is why the plan's clear set plays
-    // no part here.
-    let attrs = attr_flags(op.attr_set);
+    // no part here. The read-only bit is the exception: it waits for
+    // [`seal_read_only`], since what goes inside this mount has to be made
+    // first.
+    let attrs = attr_flags(op.attr_set & !mountattr::ATTR_RDONLY);
     fsmount(fs.as_fd(), FsMountFlags::FSMOUNT_CLOEXEC, attrs)
         .context("mount: materialise")
 }
@@ -781,6 +783,44 @@ fn request_source(at: Source<'_>) -> Result<OwnedFd> {
         }
     }
     Err(Error::msg("mount: the driver sent no source"))
+}
+
+/// Applies the read-only attribute every mount asked for.
+///
+/// A read-only mount is one nothing can be made inside, and the mounts and
+/// device nodes a configuration puts inside one are made after it: a
+/// container with `/dev` mounted read only still has `/dev/pts` mounted and
+/// its devices created under it. The bit therefore goes on here, once
+/// everything below it exists.
+///
+/// The older interface carries the bit in the flags it mounts with, so
+/// there is nothing to do for it here.
+pub fn seal_read_only(plan: &View<'_>, resolver: &mut Resolver) -> Result<()> {
+    if !has_mount_api() {
+        return Ok(());
+    }
+    let attr = MountAttr::default().set(mountattr::ATTR_RDONLY);
+    plan.mounts(|op| {
+        if op.attr_set & mountattr::ATTR_RDONLY == 0 {
+            return Ok(());
+        }
+        let target = plan.raw(op.target)?;
+        let destination = if op.extra & mount_flag::DEST_NOFOLLOW != 0 {
+            resolver.open_nofollow(target)
+        } else {
+            resolver.open(target, Create::Nothing)
+        };
+        let outcome = destination.and_then(|destination| {
+            let recursive = op.extra & mount_flag::RECURSIVE != 0;
+            mountattr::mount_setattr_fd(destination.as_fd(), recursive, &attr)
+        });
+        match outcome {
+            // A mount the configuration marked optional may never have been
+            // made, and a destination that is not there is nothing to seal.
+            Err(_) if op.extra & mount_flag::OPTIONAL != 0 => Ok(()),
+            outcome => outcome,
+        }
+    })
 }
 
 /// True for either cgroup filesystem.
@@ -1074,7 +1114,8 @@ impl Mount<'_> {
     /// mapping already. The kernel refuses a second one.
     fn apply_attributes(&self, mount: BorrowedFd<'_>, map: bool) -> Result<()> {
         let mut attr = MountAttr {
-            attr_set: self.op.attr_set,
+            // Read only last, once whatever goes inside this mount exists.
+            attr_set: self.op.attr_set & !mountattr::ATTR_RDONLY,
             attr_clr: self.op.attr_clr,
             propagation: 0,
             userns_fd: 0,
