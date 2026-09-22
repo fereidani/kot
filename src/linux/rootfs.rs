@@ -8,7 +8,10 @@
 //!    on private whatever it said. Nothing the container mounts or unmounts may
 //!    reach the host unless the configuration asked for that.
 //! 2. Make the root a mount point in its own right, which `pivot_root` requires
-//!    and which most bundles do not arrange themselves.
+//!    and which most bundles do not arrange themselves. Where the kernel can
+//!    clone the rootfs straight into a namespace of its own, steps 1, 2 and 5
+//!    collapse into entering that namespace: the root is the root from the
+//!    first moment, and nothing of the host is there to leave behind.
 //! 3. Establish the configured mounts, in the order the configuration gave.
 //! 4. Create the device nodes, including the ones the specification requires
 //!    whether or not the bundle asked for them.
@@ -143,6 +146,35 @@ pub fn prepare(container: &Container, plan: &View<'_>) -> Result<()> {
     let relax = MountAttr::default()
         .clear(mountattr::ATTR_NOSUID | mountattr::ATTR_NODEV);
     let _ = mountattr::mount_setattr(rustix::fs::CWD, root, 0, &relax);
+    Ok(())
+}
+
+/// Enters a mount namespace holding the rootfs alone, and makes it the
+/// container's.
+///
+/// The driver made the namespace from the rootfs, so its root is the
+/// container's root and nothing of the host is in it: there is no tree to
+/// pivot out of and none to detach afterwards. What is left is what
+/// [`prepare`] does for a copied tree: sever the peers the clone still has,
+/// and clear the flags the bundle's mount happened to carry.
+pub fn enter_tree(tree: BorrowedFd<'_>) -> Result<()> {
+    use rustix::mount::{MountPropagationFlags, mount_change};
+
+    crate::sys::process::setns(tree, crate::sys::clone::CLONE_NEWNS)
+        .context("rootfs: enter the container's mount namespace")?;
+    // The clone is still a peer of the mount it was taken from, so anything
+    // mounted here would appear on the host as well. Private severs that.
+    // The mode the configuration asked for goes on once the tree is built,
+    // as it does after a pivot.
+    mount_change(
+        "/",
+        MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
+    )
+    .context("rootfs: sever the root from the host")?;
+    // As in `prepare`: best effort, and for the same reason.
+    let relax = MountAttr::default()
+        .clear(mountattr::ATTR_NOSUID | mountattr::ATTR_NODEV);
+    let _ = mountattr::mount_setattr(rustix::fs::CWD, c"/", 0, &relax);
     Ok(())
 }
 

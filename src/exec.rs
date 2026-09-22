@@ -290,6 +290,7 @@ fn spawn(
         detached: options.detach,
         clone_flags: None,
         cgroup: placement,
+        tree: None,
         scratch: store.root(),
         opening: "opening the container's namespaces",
         creating: "creating the process",
@@ -308,7 +309,7 @@ fn spawn(
         prepared: (),
         in_cgroup,
         idmaps: _,
-    } = driver::spawn_sealed(&process, prepare)?;
+    } = driver::spawn_sealed(process, prepare)?;
     let plan = View::new(&lowered.arena)?;
     supervise(
         options,

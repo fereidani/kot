@@ -262,10 +262,37 @@ impl Init<'_> {
     /// Builds the container's filesystem view, in the order that works.
     fn build_filesystem(&self) -> Result<()> {
         let (plan, container) = (self.plan, &self.container);
-        rootfs::prepare(container, plan)?;
+        let cgroup_joined = core::cell::Cell::new(false);
+        // Made or joined, either leaves this process without privilege
+        // over the filesystems its mount sources are on.
+        let in_user_namespace =
+            (container.clone_flags | container.unshare_flags) & CLONE_NEWUSER
+                != 0
+                || joins_user_namespace(plan)?;
 
-        let root_path = plan.c_str(container.rootfs)?;
-        let mut resolver = Resolver::new(root_path)?;
+        // Two ways to the same tree. Given a namespace holding the rootfs
+        // alone, every mount is made while the host is still in reach and
+        // the namespace entered with them in hand; otherwise the copy of
+        // the host's tree this process was born with is prepared for the
+        // pivot below.
+        let mut ahead = Vec::new();
+        let mut resolver = if self.args.has_tree {
+            mount::make_ahead(
+                plan,
+                container,
+                self.socket,
+                &cgroup_joined,
+                &mut ahead,
+            )?;
+            // SAFETY: the driver placed the namespace at this number before
+            // the re-execution, and `has_tree` says it did.
+            let tree = unsafe { namespace::slot(Slot::Tree) };
+            rootfs::enter_tree(tree)?;
+            Resolver::new(c"/")?
+        } else {
+            rootfs::prepare(container, plan)?;
+            Resolver::new(plan.c_str(container.rootfs)?)?
+        };
 
         // Everything from here on is made inside the container and
         // belongs to it. The bundle above was reached as the runtime's own
@@ -275,19 +302,16 @@ impl Init<'_> {
         let joined = self.args.namespaces;
         let mut in_cgroup_namespace = false;
         let mut index = 0i32;
-        let cgroup_joined = core::cell::Cell::new(false);
-        // Made or joined, either leaves this process without privilege
-        // over the filesystems its mount sources are on.
-        let in_user_namespace =
-            (container.clone_flags | container.unshare_flags) & CLONE_NEWUSER
-                != 0
-                || joins_user_namespace(plan)?;
         plan.mounts(|op| {
             let at = mount::Source {
                 index,
                 socket: self.socket,
                 cgroup_joined: &cgroup_joined,
                 in_user_namespace,
+                ahead: usize::try_from(index)
+                    .ok()
+                    .and_then(|at| ahead.get(at))
+                    .map_or(mount::Ahead::Reachable, mount::Made::ahead),
             };
             index += 1;
             // Only a cgroup mount depends on the namespace, and it is the
@@ -335,21 +359,26 @@ impl Init<'_> {
             sync::expect(self.socket, Kind::HooksRun)?;
         }
 
-        if container.no_pivot {
-            rootfs::chroot(resolver.root())?;
+        // A namespace made from the rootfs has the container's root as its
+        // root already, and every cached directory below it still names
+        // what it did. After a pivot the cached descriptors name paths in
+        // the old root, so the resolver starts again from the new one.
+        let mut inside = if self.args.has_tree {
+            resolver
         } else {
-            rootfs::pivot(resolver.root())?;
-        }
+            if container.no_pivot {
+                rootfs::chroot(resolver.root())?;
+            } else {
+                rootfs::pivot(resolver.root())?;
+            }
+            drop(resolver);
+            Resolver::new(c"/")?
+        };
         // Now that the container's root is the root, it can be given the
         // propagation the configuration asked for. Doing it before the
         // change would have sent everything above back out through the
         // mount the bundle sits on.
         rootfs::apply_propagation(container)?;
-
-        // Every cached directory descriptor now names a path in the old root,
-        // so the resolver starts again from the new one.
-        drop(resolver);
-        let mut inside = Resolver::new(c"/")?;
 
         // Before the paths below are made read only, and after the root has
         // changed so that `/proc` means the container's. A configuration

@@ -153,6 +153,16 @@ inode of the overlay's own, so a container entrypoint that resolves to the
 runtime finds nothing there to write to. A read-only bind mount cannot promise
 that, because it shares its inode with the mount it came from.
 
+**The mount namespace holds the rootfs alone.** A mount namespace made at
+the clone starts as a copy of the host's whole tree, which init then has to
+sever from the host, pivot out of and detach, and which the kernel takes apart
+again when the container exits. Where the kernel can clone the rootfs straight
+into a namespace of its own, the driver does that instead and init enters it:
+every mount is made while the host is still in reach and attached once it is
+not, the container's root is the root from the first moment, and there is
+nothing of the host to leave behind. A user namespace, a hook that runs before
+the pivot, and an older kernel all take the copied tree and the pivot.
+
 **Mounts go through the kernel's newer interface.** `fsopen`, `fsmount`,
 `open_tree`, `move_mount`, and `mount_setattr`, with destinations resolved by
 `openat2` under `RESOLVE_BENEATH` and `RESOLVE_NO_MAGICLINKS`, relative to a

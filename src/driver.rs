@@ -51,7 +51,7 @@ use crate::{
         spec::Resources,
     },
     state::{LaterHooks, Record, Store},
-    sys::clone::{CLONE_NEWUSER, CloneSpec, Fork},
+    sys::clone::{CLONE_NEWNS, CLONE_NEWUSER, CloneSpec, Fork},
 };
 
 /// What a successful creation produced.
@@ -168,12 +168,31 @@ fn start_container(request: &Request<'_>, clone_flags: u64) -> Result<Created> {
         .precreate(resources(spec))
         .context("creating the container's cgroup")?;
 
+    // Where the kernel can clone the rootfs into a mount namespace of its
+    // own, init is given that instead of a copy of the host's tree, and
+    // the clone makes no mount namespace of its own.
+    let tree = if builds_from_rootfs(request)? {
+        let rootfs = request
+            .plan
+            .c_str(request.plan.container()?.rootfs)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        crate::linux::mount::tree_namespace(rootfs)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        None
+    };
+    let clone_flags = if tree.is_some() {
+        clone_flags & !CLONE_NEWNS
+    } else {
+        clone_flags
+    };
     let process = ProcessRequest {
         lowered: request.lowered,
         preserved: options.preserve_fds,
         detached: awaiting_start || options.detach,
         clone_flags: Some(clone_flags),
         cgroup: placement,
+        tree,
         scratch: request.store.root(),
         opening: "opening the namespaces to join",
         creating: "creating the container process",
@@ -188,7 +207,7 @@ fn start_container(request: &Request<'_>, clone_flags: u64) -> Result<Created> {
             terminal_ends(options, request.spec, awaiting_start)?;
         Ok((start_fifo, console_socket, relay_end))
     };
-    let spawned = match spawn_sealed(&process, prepare) {
+    let spawned = match spawn_sealed(process, prepare) {
         Ok(spawned) => spawned,
         Err(error) => {
             // Nothing is in the cgroup yet, so it goes as easily as it came.
@@ -219,6 +238,9 @@ pub(crate) struct ProcessRequest<'a> {
     pub(crate) clone_flags: Option<u64>,
     /// The cgroup to create the process in, when one exists already.
     pub(crate) cgroup: Option<BorrowedFd<'a>>,
+    /// A mount namespace holding the rootfs alone, when the kernel could
+    /// make one, for init to build the filesystem in.
+    pub(crate) tree: Option<OwnedFd>,
     /// A directory the runtime owns, which the sealed image is built over.
     pub(crate) scratch: &'a Path,
     pub(crate) opening: &'static str,
@@ -254,7 +276,7 @@ pub(crate) struct Spawned<T> {
 /// one place keeps the descriptor protocol in one place too. `prepare` runs
 /// after the namespaces are open and before anything is handed to the child.
 pub(crate) fn spawn_sealed<T>(
-    request: &ProcessRequest<'_>,
+    request: ProcessRequest<'_>,
     prepare: impl FnOnce() -> Result<Prepared<T>>,
 ) -> Result<Spawned<T>> {
     let lowered = request.lowered;
@@ -292,6 +314,7 @@ pub(crate) fn spawn_sealed<T>(
         has_console_socket: console_socket.is_some(),
         has_start_fifo: start_fifo.is_some(),
         detached: request.detached,
+        has_tree: request.tree.is_some(),
     };
 
     let handoff = Handoff {
@@ -299,6 +322,7 @@ pub(crate) fn spawn_sealed<T>(
         plan: Some(plan_fd),
         start_fifo,
         console_socket,
+        tree: request.tree,
         namespaces,
         idmaps,
     };
@@ -934,6 +958,39 @@ fn terminal_ends(
         ),
         None => Ok((None, None)),
     }
+}
+
+/// Whether the container's mount namespace can be made from the rootfs alone.
+///
+/// It can when the configuration asks for a new mount namespace at the clone
+/// and nothing in the container's namespace needs the host's tree. A user
+/// namespace does: its owner has no right to enter a namespace the driver
+/// made. Hooks that run before the pivot do: they reach the bundle through
+/// the host's tree. A source copied as a symbolic link does: it is read by
+/// path once the mount is reached.
+fn builds_from_rootfs(request: &Request<'_>) -> Result<bool> {
+    let container = request.plan.container()?;
+    if container.clone_flags & CLONE_NEWNS == 0 || container.hooks_before_pivot
+    {
+        return Ok(false);
+    }
+    let lowered = request.lowered;
+    if lowered.creates_userns
+        || lowered.joins.iter().any(|join| join.flag == CLONE_NEWUSER)
+    {
+        return Ok(false);
+    }
+    let mut by_path = false;
+    request
+        .plan
+        .mounts(|op| {
+            by_path |= op.extra
+                & crate::oci::plan::record::mount_flag::COPY_SYMLINK
+                != 0;
+            Ok(())
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(!by_path)
 }
 
 /// The resource limits a configuration asked for, if it asked for any.

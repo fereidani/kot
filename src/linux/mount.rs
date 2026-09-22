@@ -23,11 +23,14 @@ use std::{
 use crate::{
     linux::copyup,
     oci::plan::{
-        View,
+        Container, View,
         record::{MountKind, MountOp, mount_flag},
     },
     sys::{
-        error::{Context, EACCES, ENOENT, ENOTDIR, EPERM, Error, Result},
+        error::{
+            Context, EACCES, EINVAL, ENOENT, ENOSYS, ENOTDIR, EPERM, Error,
+            Result,
+        },
         mountattr::{self, MountAttr},
         path::{Path, PathBuf},
     },
@@ -506,6 +509,256 @@ pub(crate) fn clone_path(
     open_tree(rustix::fs::CWD, source, flags).context(context)
 }
 
+/// `OPEN_TREE_NAMESPACE`: put the cloned tree in a mount namespace of its
+/// own. Newer than the flags rustix names, so spelled out here.
+const OPEN_TREE_NAMESPACE: u32 = 1 << 1;
+
+/// Clones the rootfs into a mount namespace holding nothing else.
+///
+/// A mount namespace made at the clone starts as a copy of the host's whole
+/// tree, which init then has to sever from the host, pivot out of and
+/// detach, and which the kernel takes apart again when the container exits.
+/// One made here holds the rootfs alone: init enters it and the container's
+/// root is the root. Answers `None` on a kernel without the flag, and for a
+/// runtime the kernel refuses, so the caller can build the namespace the
+/// older way.
+pub fn tree_namespace(rootfs: &CStr) -> Result<Option<OwnedFd>> {
+    use rustix::mount::{OpenTreeFlags, open_tree};
+
+    let flags = OpenTreeFlags::from_bits_retain(OPEN_TREE_NAMESPACE)
+        | OpenTreeFlags::OPEN_TREE_CLOEXEC
+        | OpenTreeFlags::AT_RECURSIVE;
+    match open_tree(rustix::fs::CWD, rootfs, flags) {
+        Ok(tree) => Ok(Some(tree)),
+        // A kernel without the flag refuses it as invalid, and one without
+        // the interface at all has no such call.
+        Err(e) if matches!(e.raw_os_error(), EINVAL | ENOSYS | EPERM) => {
+            Ok(None)
+        }
+        Err(e) => Err(Error::from(e)
+            .describe("mount: clone the rootfs into a namespace of its own")),
+    }
+}
+
+/// Makes every mount's detached object while the host is still reachable.
+///
+/// Sources are paths on the host, and the newer interface resolves them when
+/// the object is made rather than when it is attached. Once init is in a
+/// namespace holding the rootfs alone, no host path resolves, so each mount
+/// is made here and attached there. A cgroup filesystem is the exception:
+/// its superblock is rooted in the cgroup namespace of whoever makes it,
+/// which init makes only once the driver has settled the cgroup, and it
+/// needs nothing from the host.
+///
+/// A tree cloned out of the host's namespace is still a peer of the mount it
+/// came from, so a mount the container later makes beneath it would appear
+/// on the host. It is given what the copied tree of the older path is given
+/// before any source is taken from it: the mode the configuration named for
+/// the root, or private.
+pub fn make_ahead(
+    plan: &View<'_>,
+    container: &Container,
+    socket: BorrowedFd<'_>,
+    cgroup_joined: &core::cell::Cell<bool>,
+    out: &mut Vec<Made>,
+) -> Result<()> {
+    use crate::oci::lower::tables::ms;
+
+    let (propagation, recursive) = if container.rootfs_propagation == 0 {
+        (ms::PRIVATE, true)
+    } else {
+        (
+            container.rootfs_propagation & !ms::REC,
+            container.rootfs_propagation & ms::REC != 0,
+        )
+    };
+    let sever = MountAttr {
+        propagation,
+        ..MountAttr::default()
+    };
+    out.clear();
+    let mut index = 0i32;
+    plan.mounts(|op| {
+        let at = Source {
+            index,
+            socket,
+            cgroup_joined,
+            in_user_namespace: false,
+            ahead: Ahead::Reachable,
+        };
+        index += 1;
+        let kind = op.mount_kind().ok_or_else(|| {
+            Error::msg("mount: unknown kind from a foreign plan")
+        })?;
+        let made = match kind {
+            MountKind::Filesystem if is_cgroup(plan.text(op.fstype)?) => {
+                Ok(Made::Later)
+            }
+            MountKind::Filesystem => {
+                create_filesystem(plan, &op).map(Made::Mount)
+            }
+            MountKind::Bind | MountKind::RecursiveBind => {
+                open_bind(plan, &op, at, kind == MountKind::RecursiveBind)
+                    .and_then(|(tree, _)| {
+                        mountattr::mount_setattr_fd(
+                            tree.as_fd(),
+                            recursive,
+                            &sever,
+                        )
+                        .map_err(|e| e.describe("mount: sever a source"))?;
+                        Ok(Made::Mount(tree))
+                    })
+            }
+            MountKind::MaskFile | MountKind::MaskDirectory => Ok(Made::Later),
+        };
+        match made {
+            Ok(made) => out.push(made),
+            // The same allowance `establish` makes: a source the
+            // configuration said may be absent is one to skip, not one
+            // to refuse the container over.
+            Err(_) if op.extra & mount_flag::OPTIONAL != 0 => {
+                out.push(Made::Skipped);
+            }
+            Err(e) => return Err(e),
+        }
+        Ok(())
+    })
+}
+
+/// What was made for a mount ahead of the change of mount namespace.
+pub enum Made {
+    /// Nothing yet: the mount is made in place, needing nothing of the host.
+    Later,
+    /// The detached mount or tree.
+    Mount(OwnedFd),
+    /// The source was absent and the configuration allowed for that.
+    Skipped,
+}
+
+impl Made {
+    /// What the mount itself is told.
+    #[must_use]
+    pub fn ahead(&self) -> Ahead<'_> {
+        match self {
+            Self::Later => Ahead::Later,
+            Self::Mount(fd) => Ahead::Made(fd.as_fd()),
+            Self::Skipped => Ahead::Skipped,
+        }
+    }
+}
+
+/// What a mount finds made for it, and whether the host is still in reach.
+#[derive(Clone, Copy)]
+pub enum Ahead<'a> {
+    /// Nothing, and the host is reachable: the mount makes its own.
+    Reachable,
+    /// Nothing, and the host is out of reach: the mount is one that needs
+    /// nothing from it.
+    Later,
+    /// The detached mount or tree, made while the host was reachable.
+    Made(BorrowedFd<'a>),
+    /// Nothing, because the source was absent and allowed to be.
+    Skipped,
+}
+
+/// A detached mount, whichever side owns it.
+enum Detached<'a> {
+    Owned(OwnedFd),
+    Borrowed(BorrowedFd<'a>),
+}
+
+impl Detached<'_> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            Self::Owned(fd) => fd.as_fd(),
+            Self::Borrowed(fd) => *fd,
+        }
+    }
+}
+
+/// Clones a bind source out of the host's tree, and says whether the driver
+/// did it and mapped it on the way.
+///
+/// A mount this process cannot map is asked for before it is opened, not
+/// after a failure that leaves one half made. One the container's root
+/// cannot reach at all is asked for too: the identity the runtime was
+/// started with still may, and that one is the driver's.
+fn open_bind(
+    plan: &View<'_>,
+    op: &MountOp,
+    at: Source<'_>,
+    recursive: bool,
+) -> Result<(OwnedFd, bool)> {
+    let mapped_elsewhere = op.idmap_fd >= 0 && at.in_user_namespace;
+    if mapped_elsewhere {
+        return Ok((request_source(at)?, true));
+    }
+    let source = plan.c_str(op.source)?;
+    let nofollow = op.extra & mount_flag::SRC_NOFOLLOW != 0;
+    match clone_path(source, recursive, nofollow, "mount: clone source tree") {
+        Ok(tree) => Ok((tree, false)),
+        Err(e) if matches!(e.errno(), EACCES | EPERM) => {
+            Ok((request_source(at)?, false))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// True when a detached tree is rooted at something other than a directory.
+fn tree_is_file(tree: BorrowedFd<'_>) -> bool {
+    use rustix::fs::{FileType, fstat};
+    fstat(tree).is_ok_and(|stat| {
+        FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+    })
+}
+
+/// Makes the superblock and the detached mount a filesystem mount asks for.
+fn create_filesystem(plan: &View<'_>, op: &MountOp) -> Result<OwnedFd> {
+    use rustix::mount::{
+        FsMountFlags, FsOpenFlags, fsconfig_create, fsconfig_set_flag,
+        fsconfig_set_string, fsmount, fsopen,
+    };
+
+    let fstype = plan.text(op.fstype)?;
+    let data = plan.text(op.data)?;
+    let source = plan.text(op.source)?;
+
+    let fs = fsopen(fstype, FsOpenFlags::FSOPEN_CLOEXEC)
+        .context("mount: open filesystem")?;
+    if !source.is_empty() && fstype != "tmpfs" {
+        fsconfig_set_string(fs.as_fd(), "source", source)
+            .context("mount: set source")?;
+    }
+    for option in data.split(',').filter(|o| !o.is_empty()) {
+        // An option without a value is a flag, and a filesystem that
+        // expects one rejects it outright if it arrives as a string with
+        // an empty value. `devpts` and `newinstance` are the pair every
+        // bundle hits.
+        let Some((key, value)) = option.split_once('=') else {
+            fsconfig_set_flag(fs.as_fd(), option).context("mount: set flag")?;
+            continue;
+        };
+        fsconfig_set_string(fs.as_fd(), key, value)
+            .context("mount: set option")?;
+    }
+    // The label is set as its own option rather than through `data`,
+    // which is split on commas that an MCS label carries itself.
+    let context = plan.text(op.context)?;
+    if !context.is_empty() {
+        fsconfig_set_string(fs.as_fd(), "context", context)
+            .context("mount: set selinux context")?;
+    }
+    fsconfig_create(fs.as_fd()).context("mount: create superblock")?;
+
+    // `fsmount` takes every attribute a new mount can carry, so the only
+    // thing left for `mount_setattr` is an id mapping. A fresh superblock
+    // has no attributes to clear, which is why the plan's clear set plays
+    // no part here.
+    let attrs = attr_flags(op.attr_set);
+    fsmount(fs.as_fd(), FsMountFlags::FSMOUNT_CLOEXEC, attrs)
+        .context("mount: materialise")
+}
+
 /// Asks the driver to open a mount's source and hand it over.
 fn request_source(at: Source<'_>) -> Result<OwnedFd> {
     use crate::linux::sync::{self, Kind, Message};
@@ -628,77 +881,47 @@ pub struct Source<'a> {
     /// Mapping a mount is a privilege over the source's filesystem, which
     /// such a namespace does not hold, so the driver does those.
     pub in_user_namespace: bool,
+    /// What was made for this mount before the host went out of reach, if
+    /// it did.
+    pub ahead: Ahead<'a>,
 }
 
 impl Mount<'_> {
     /// Mounts a new superblock of the filesystem the plan names.
     fn filesystem(&mut self) -> Result<()> {
-        use rustix::mount::{
-            FsMountFlags, FsOpenFlags, fsconfig_create, fsconfig_set_flag,
-            fsconfig_set_string, fsmount, fsopen,
+        let mount = match self.at.ahead {
+            Ahead::Made(mount) => Detached::Borrowed(mount),
+            Ahead::Skipped => return Ok(()),
+            reach @ (Ahead::Reachable | Ahead::Later) => {
+                match create_filesystem(self.plan, self.op) {
+                    Ok(mount) => Detached::Owned(mount),
+                    // A fresh cgroup superblock needs privilege in the user
+                    // namespace that owns the cgroup namespace the mounter
+                    // is in, so a container in a user namespace of its own
+                    // that kept the host's cgroup namespace cannot have
+                    // one. What it can have is the tree the host already
+                    // mounted, under the flags the plan asked for, as long
+                    // as the host's tree is still there to be reached.
+                    Err(e)
+                        if e.errno() == EPERM
+                            && matches!(reach, Ahead::Reachable)
+                            && is_cgroup(self.plan.text(self.op.fstype)?) =>
+                    {
+                        return self.bind_host_cgroups();
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         };
-
-        let fstype = self.plan.text(self.op.fstype)?;
-        let data = self.plan.text(self.op.data)?;
-        let source = self.plan.text(self.op.source)?;
-
-        let fs = fsopen(fstype, FsOpenFlags::FSOPEN_CLOEXEC)
-            .context("mount: open filesystem")?;
-        if !source.is_empty() && fstype != "tmpfs" {
-            fsconfig_set_string(fs.as_fd(), "source", source)
-                .context("mount: set source")?;
-        }
-        for option in data.split(',').filter(|o| !o.is_empty()) {
-            // An option without a value is a flag, and a filesystem that
-            // expects one rejects it outright if it arrives as a string with
-            // an empty value. `devpts` and `newinstance` are the pair every
-            // bundle hits.
-            let Some((key, value)) = option.split_once('=') else {
-                fsconfig_set_flag(fs.as_fd(), option)
-                    .context("mount: set flag")?;
-                continue;
-            };
-            fsconfig_set_string(fs.as_fd(), key, value)
-                .context("mount: set option")?;
-        }
-        // The label is set as its own option rather than through `data`,
-        // which is split on commas that an MCS label carries itself.
-        let context = self.plan.text(self.op.context)?;
-        if !context.is_empty() {
-            fsconfig_set_string(fs.as_fd(), "context", context)
-                .context("mount: set selinux context")?;
-        }
-        match fsconfig_create(fs.as_fd()) {
-            Ok(()) => {}
-            // A fresh cgroup superblock needs privilege in the user
-            // namespace that owns the cgroup namespace the mounter is in,
-            // so a container in a user namespace of its own that kept the
-            // host's cgroup namespace cannot have one. What it can have is
-            // the tree the host already mounted, under the flags the plan
-            // asked for.
-            Err(e) if e.raw_os_error() == EPERM && is_cgroup(fstype) => {
-                return self.bind_host_cgroups();
-            }
-            Err(e) => {
-                return Err(Error::from(e).describe("mount: create superblock"));
-            }
-        }
-
-        // `fsmount` takes every attribute a new mount can carry, so the only
-        // thing left for `mount_setattr` is an id mapping. A fresh superblock
-        // has no attributes to clear, which is why the plan's clear set plays
-        // no part here.
-        let attrs = attr_flags(self.op.attr_set);
-        let mount = fsmount(fs.as_fd(), FsMountFlags::FSMOUNT_CLOEXEC, attrs)
-            .context("mount: materialise")?;
+        let mount = mount.as_fd();
         if let Some(userns) = self.idmap {
             let attr = MountAttr::default().idmap(userns);
-            mountattr::mount_setattr_fd(mount.as_fd(), false, &attr)?;
+            mountattr::mount_setattr_fd(mount, false, &attr)?;
         }
         if self.op.extra & mount_flag::TMPCOPYUP != 0 {
-            self.copy_up(mount.as_fd())?;
+            self.copy_up(mount)?;
         }
-        self.attach(mount.as_fd())
+        self.attach(mount)
     }
 
     /// Attaches the host's cgroup tree in place of a superblock the kernel
@@ -815,37 +1038,33 @@ impl Mount<'_> {
 
     /// Clones the source out of the host's mount tree and attaches it.
     fn bind(&mut self, recursive: bool) -> Result<()> {
-        let source = self.plan.c_str(self.op.source)?;
-        if self.op.extra & mount_flag::COPY_SYMLINK != 0
-            && source_is_symlink(source)
-        {
-            return self.copy_symlink(source);
-        }
-        // A mount this process cannot map is asked for before it is
-        // opened, not after a failure that leaves one half made.
-        let mapped_elsewhere =
-            self.idmap.is_some() && self.at.in_user_namespace;
-        let nofollow = self.op.extra & mount_flag::SRC_NOFOLLOW != 0;
-        let tree = if mapped_elsewhere {
-            request_source(self.at)?
-        } else {
-            match clone_path(
-                source,
-                recursive,
-                nofollow,
-                "mount: clone source tree",
-            ) {
-                Ok(tree) => tree,
-                // The container's root cannot reach it; the identity the
-                // runtime was started with still may, and that one is the
-                // driver's.
-                Err(e) if matches!(e.errno(), EACCES | EPERM) => {
-                    request_source(self.at)?
+        let (tree, mapped) = match self.at.ahead {
+            // Mapped by init itself, since a tree is made ahead only where
+            // there is no user namespace to put the driver in charge of it.
+            Ahead::Made(tree) => (Detached::Borrowed(tree), false),
+            Ahead::Skipped => return Ok(()),
+            // A source is a path on the host, and the host is gone: the
+            // path would resolve inside the container and bind the wrong
+            // thing under the right name.
+            Ahead::Later => {
+                return Err(Error::msg(
+                    "mount: a bind source was not opened while the host \
+                     was in reach",
+                ));
+            }
+            Ahead::Reachable => {
+                let source = self.plan.c_str(self.op.source)?;
+                if self.op.extra & mount_flag::COPY_SYMLINK != 0
+                    && source_is_symlink(source)
+                {
+                    return self.copy_symlink(source);
                 }
-                Err(e) => return Err(e),
+                let (tree, mapped) =
+                    open_bind(self.plan, self.op, self.at, recursive)?;
+                (Detached::Owned(tree), mapped)
             }
         };
-        self.apply_attributes(tree.as_fd(), !mapped_elsewhere)?;
+        self.apply_attributes(tree.as_fd(), !mapped)?;
         self.attach(tree.as_fd())
     }
 
@@ -896,10 +1115,13 @@ impl Mount<'_> {
         if self.op.extra & mount_flag::DEST_IS_FILE != 0 {
             return Ok(true);
         }
-        Ok(
-            matches!(self.kind, MountKind::Bind | MountKind::RecursiveBind)
-                && source_is_file(self.plan.c_str(self.op.source)?),
-        )
+        if !matches!(self.kind, MountKind::Bind | MountKind::RecursiveBind) {
+            return Ok(false);
+        }
+        match self.at.ahead {
+            Ahead::Made(tree) => Ok(tree_is_file(tree)),
+            _ => Ok(source_is_file(self.plan.c_str(self.op.source)?)),
+        }
     }
 
     /// How to open the destination: what is there, or else what to make.

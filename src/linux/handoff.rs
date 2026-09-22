@@ -40,6 +40,9 @@ pub enum Slot {
     StartFifo,
     /// A socket the pseudo-terminal's controlling end is sent over.
     ConsoleSocket,
+    /// A mount namespace holding the rootfs alone, when the driver could
+    /// make one, for init to build the container's filesystem in.
+    Tree,
     /// First namespace to join. Later ones follow in order, and the
     /// id-mapping namespaces follow those.
     Namespaces,
@@ -54,7 +57,8 @@ impl Slot {
             Self::Plan => 1,
             Self::StartFifo => 2,
             Self::ConsoleSocket => 3,
-            Self::Namespaces => 4,
+            Self::Tree => 4,
+            Self::Namespaces => 5,
         }
     }
 
@@ -85,6 +89,9 @@ pub struct Handoff {
     pub start_fifo: Option<OwnedFd>,
     /// The console socket, when the caller asked for one.
     pub console_socket: Option<OwnedFd>,
+    /// A mount namespace holding the rootfs alone, when the kernel could
+    /// make one.
+    pub tree: Option<OwnedFd>,
     /// Namespaces to join, in the order the plan names them.
     pub namespaces: Vec<OwnedFd>,
     /// User namespaces carrying the id mapping of a mount, in the order the
@@ -106,6 +113,7 @@ impl Handoff {
             (self.plan.as_ref(), Slot::Plan.fd()),
             (self.start_fifo.as_ref(), Slot::StartFifo.fd()),
             (self.console_socket.as_ref(), Slot::ConsoleSocket.fd()),
+            (self.tree.as_ref(), Slot::Tree.fd()),
         ];
         for (source, target) in moves {
             let Some(source) = source else { continue };
@@ -124,12 +132,17 @@ impl Handoff {
     /// The highest descriptor number in use after [`Handoff::install`].
     #[must_use]
     pub fn highest(&self) -> RawFd {
+        if self.namespaces.is_empty() && self.idmaps.is_empty() {
+            return if self.tree.is_some() {
+                Slot::Tree.fd()
+            } else {
+                Slot::ConsoleSocket.fd()
+            };
+        }
         // The last descriptor sits one below the next free number, so taking
         // the number of the one after it would leave one above the sweep and
         // hand it to init unasked.
-        Slot::idmap(self.namespaces.len(), self.idmaps.len())
-            .saturating_sub(1)
-            .max(Slot::ConsoleSocket.fd())
+        Slot::idmap(self.namespaces.len(), self.idmaps.len()).saturating_sub(1)
     }
 }
 
@@ -226,6 +239,9 @@ pub fn park_program(program: OwnedFd, preserved: usize) -> Result<RawFd> {
 ///
 /// Init takes no configuration on its command line beyond how many namespaces
 /// it was given, because everything else is in the plan.
+// Each flag says whether one descriptor was handed over, and any of them can
+// hold with any other; there is no state machine here to draw out of them.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InitArgs {
     /// How many namespace descriptors follow the fixed block.
@@ -246,6 +262,9 @@ pub struct InitArgs {
     /// lingering; a detached one would be killed by it the moment the command
     /// returned.
     pub detached: bool,
+    /// True when a mount namespace holding the rootfs alone was handed
+    /// over, for init to build the filesystem in rather than pivot into.
+    pub has_tree: bool,
 }
 
 impl InitArgs {
@@ -254,13 +273,14 @@ impl InitArgs {
     #[must_use]
     pub fn encode(&self) -> String {
         format!(
-            "{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}",
             self.namespaces,
             self.preserved,
             u8::from(self.has_console_socket),
             u8::from(self.has_start_fifo),
             u8::from(self.detached),
-            self.idmaps
+            self.idmaps,
+            u8::from(self.has_tree)
         )
     }
 
@@ -274,6 +294,7 @@ impl InitArgs {
         };
         let detached = parts.next().unwrap_or("0");
         let idmaps = parts.next().unwrap_or("0");
+        let tree = parts.next().unwrap_or("0");
         let number = |value: &str| -> Result<usize> {
             value.parse().map_err(|_| Error::msg("init: bad number"))
         };
@@ -284,6 +305,7 @@ impl InitArgs {
             has_console_socket: number(console)? != 0,
             has_start_fifo: number(fifo)? != 0,
             detached: number(detached)? != 0,
+            has_tree: number(tree)? != 0,
         })
     }
 }
