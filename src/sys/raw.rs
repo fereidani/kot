@@ -40,6 +40,7 @@ syscall_numbers! {
     DUP3 = "`dup3(2)`", 292, 24;
     EXECVEAT = "`execveat(2)`", 322, 281;
     EXIT_GROUP = "`exit_group(2)`", 231, 94;
+    FACCESSAT2 = "`faccessat2(2)`", 439, 439;
     IOPRIO_SET = "`ioprio_set(2)`", 251, 30;
     IOCTL = "`ioctl(2)`", 16, 29;
     KEYCTL = "`keyctl(2)`", 250, 219;

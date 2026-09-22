@@ -2579,3 +2579,35 @@ fn the_payload_inherits_no_ignored_signal() {
     // Bit twelve is `SIGPIPE`, which the runtime ignores for itself.
     assert_eq!(mask & (1 << 12), 0, "SIGPIPE should not be ignored");
 }
+
+/// the caller would see the container exit rather than a reason.
+#[test]
+fn a_payload_that_may_not_be_executed_is_refused() {
+    if !privileged() {
+        return;
+    }
+    let bundle = Bundle::with_config(
+        "noexec-payload",
+        &["/nx/sh", "-c", "true"],
+        |config| {
+            *config = config.replace(
+                r#"    { "destination": "/proc", "type": "proc", "source": "proc" },"#,
+                r#"    { "destination": "/proc", "type": "proc", "source": "proc" },
+    {
+      "destination": "/nx",
+      "type": "bind",
+      "source": "/usr/bin",
+      "options": ["rbind", "ro", "noexec"]
+    },"#,
+            );
+        },
+    );
+
+    let output = bundle.runtime(&["run", &bundle.id()]);
+    assert!(!output.status.success(), "a noexec payload cannot run");
+    let text = stderr(&output);
+    assert!(
+        text.contains("cannot be executed") && text.contains("`/nx/sh`"),
+        "the failure should name the payload: {text}"
+    );
+}

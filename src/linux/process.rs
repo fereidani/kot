@@ -18,7 +18,7 @@
 //! 7. The seccomp filter, last, because installing it restricts what the steps
 //!    above would have been able to do.
 
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use rustix::{
     io::{FdFlags, fcntl_setfd},
@@ -33,6 +33,7 @@ use crate::{
         error::{Context, Error, Result},
         path::PathBuf,
         prctl, process as sys,
+        raw::{arg_ref, nr, ret_unit, syscall4},
         seccomp::SockFilter,
     },
 };
@@ -774,6 +775,31 @@ fn is_regular_file(fd: BorrowedFd<'_>) -> bool {
     })
 }
 
+/// True when a descriptor names something that can be executed.
+///
+/// The answer covers the mount as well as the file, so a program on a mount
+/// the configuration asked to be `noexec` is refused here rather than by the
+/// execution itself, where there is nobody left to report it to.
+fn is_executable(fd: BorrowedFd<'_>) -> bool {
+    /// `X_OK`.
+    const X_OK: usize = 1;
+    /// `AT_EMPTY_PATH`.
+    const AT_EMPTY_PATH: usize = 0x1000;
+
+    // SAFETY: the path is an empty NUL terminated string, which
+    // `AT_EMPTY_PATH` makes the kernel ignore in favour of the descriptor.
+    let r = unsafe {
+        syscall4(
+            nr::FACCESSAT2,
+            fd.as_raw_fd().unsigned_abs() as usize,
+            arg_ref(&0u8),
+            X_OK,
+            AT_EMPTY_PATH,
+        )
+    };
+    ret_unit(r, "process: check the payload").is_ok()
+}
+
 /// Resolves the payload inside the container.
 ///
 /// A name with no separator is looked up along `PATH`, which the specification
@@ -825,6 +851,12 @@ pub fn resolve_program(command: &Command) -> Result<OwnedFd> {
             return Err(Error::new(
                 crate::sys::error::EPERM,
                 "process: the payload is not a regular file",
+            ));
+        }
+        if !is_executable(fd.as_fd()) {
+            return Err(Error::new(
+                crate::sys::error::EACCES,
+                "process: the payload cannot be executed",
             ));
         }
         Ok(fd)
