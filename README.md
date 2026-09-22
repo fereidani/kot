@@ -53,10 +53,17 @@ uninstall` removes it again.
 make PREFIX=/usr DESTDIR=/tmp/pkg install
 ```
 
-For a binary with nothing to link against at all:
+The binary `make` builds is linked statically against musl, so it needs the
+musl target for the host's architecture, which `rustup target add
+x86_64-unknown-linux-musl` installs. The runtime is executed twice per
+container, once as the driver and once as the container's init, and a
+dynamically linked build pays the loader both times: about a millisecond and
+a half per container, out of three and a half. `cargo build --release` on its
+own produces that dynamically linked build; to get the static one from
+`cargo install`, name the target:
 
 ```bash
-cargo build --release --target x86_64-unknown-linux-musl
+cargo install kot --target x86_64-unknown-linux-musl
 ```
 
 ## Usage
@@ -69,8 +76,8 @@ podman --runtime /path/to/kot run --rm docker.io/library/alpine echo hello
 
 `/path/to/kot` is wherever the binary landed: `/usr/local/bin/kot` after `sudo
 make install`, `~/.cargo/bin/kot` after `cargo install kot`, or
-`target/release/kot` in a build tree. `command -v kot` prints the one on your
-`PATH`.
+`target/x86_64-unknown-linux-musl/release/kot` in a build tree. `command -v
+kot` prints the one on your `PATH`.
 
 Or drive it directly, the way an engine would:
 

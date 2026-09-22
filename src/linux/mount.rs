@@ -27,7 +27,7 @@ use crate::{
         record::{MountKind, MountOp, mount_flag},
     },
     sys::{
-        error::{Context, EACCES, EPERM, Error, Result},
+        error::{Context, EACCES, ENOENT, ENOTDIR, EPERM, Error, Result},
         mountattr::{self, MountAttr},
         path::{Path, PathBuf},
     },
@@ -188,15 +188,24 @@ impl Resolver {
             let parent = self.directory_at(at);
             let mut name = PathBuf::<256>::new();
             name.push_bytes(component)?;
-            if create == Create::Directories {
-                create_at(
-                    parent,
-                    name.as_c_str(),
-                    Create::Directories,
-                    "mount: create directory",
-                )?;
-            }
-            let opened = open_component(parent, name.as_c_str(), true)?;
+            // Opened before anything is made: nearly every directory a
+            // bundle mounts on is one the image ships, and making it first
+            // would be a refused call for each of them.
+            let opened = match open_component(parent, name.as_c_str(), true) {
+                Ok(opened) => opened,
+                Err(e)
+                    if create == Create::Directories && e.errno() == ENOENT =>
+                {
+                    create_at(
+                        parent,
+                        name.as_c_str(),
+                        Create::Directories,
+                        "mount: create directory",
+                    )?;
+                    open_component(parent, name.as_c_str(), true)?
+                }
+                Err(e) => return Err(e),
+            };
             key.join(component)?;
             self.cache.push((key.clone(), opened));
             at = Some(self.cache.len() - 1);
@@ -220,15 +229,20 @@ impl Resolver {
     ) -> Result<OwnedFd> {
         let mut path = PathBuf::<256>::new();
         path.push_bytes(name)?;
-        if create == Create::File {
-            create_at(
-                parent,
-                path.as_c_str(),
-                Create::File,
-                "mount: create file",
-            )?;
+        // As for a directory: what the image ships is opened, and only a
+        // name it lacks is made.
+        match open_component(parent, path.as_c_str(), false) {
+            Err(e) if create == Create::File && e.errno() == ENOENT => {
+                create_at(
+                    parent,
+                    path.as_c_str(),
+                    Create::File,
+                    "mount: create file",
+                )?;
+                open_component(parent, path.as_c_str(), false)
+            }
+            opened => opened,
         }
-        open_component(parent, path.as_c_str(), false)
     }
 }
 
@@ -533,24 +547,12 @@ pub fn establish(
         .mount_kind()
         .ok_or_else(|| Error::msg("mount: unknown kind from a foreign plan"))?;
     let target = plan.raw(op.target)?;
-    // A destination has to match what is being put on it: a bind of a file
-    // needs a file underneath, and a bind of a directory needs a directory.
-    // The configuration rarely says which, so the source decides.
-    let wants_file = op.extra & mount_flag::DEST_IS_FILE != 0
-        || (matches!(kind, MountKind::Bind | MountKind::RecursiveBind)
-            && source_is_file(plan.c_str(op.source)?));
-    let create = if wants_file {
-        Create::File
-    } else {
-        Create::Directories
-    };
-
     let mut mount = Mount {
         plan,
         resolver,
         op,
+        kind,
         target,
-        create,
         idmap,
         at,
     };
@@ -591,10 +593,18 @@ struct Mount<'a> {
     plan: &'a View<'a>,
     resolver: &'a mut Resolver,
     op: &'a MountOp,
+    kind: MountKind,
     target: &'a [u8],
-    create: Create,
     idmap: Option<BorrowedFd<'a>>,
     at: Source<'a>,
+}
+
+/// What the image has at a mount's destination.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Existing {
+    Directory,
+    File,
+    Nothing,
 }
 
 /// Where this mount sits in the plan, and who to ask for its source.
@@ -860,6 +870,47 @@ impl Mount<'_> {
         mountattr::mount_setattr_fd(mount, recursive, &attr)
     }
 
+    /// Looks at what the image has where this mount goes.
+    ///
+    /// A directory found here stays open in the resolver's cache, so the
+    /// caller's own open of it costs nothing more.
+    fn existing(&mut self) -> Result<Existing> {
+        match self.resolver.open_directory(self.target, Create::Nothing) {
+            Ok(_) => Ok(Existing::Directory),
+            Err(e) if e.errno() == ENOENT => Ok(Existing::Nothing),
+            // The last component is a file, or a component above it is;
+            // the open of a file below tells the two apart.
+            Err(e) if e.errno() == ENOTDIR => Ok(Existing::File),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Decides what to make where the image has nothing.
+    ///
+    /// A destination has to match what is being put on it: a bind of a file
+    /// needs a file underneath, and a bind of a directory needs a directory.
+    /// The configuration rarely says which, so the source decides. Asked
+    /// only when something has to be made, since what the image ships is
+    /// used as it is and the kernel refuses a mismatch in the move.
+    fn wants_file(&self) -> Result<bool> {
+        if self.op.extra & mount_flag::DEST_IS_FILE != 0 {
+            return Ok(true);
+        }
+        Ok(
+            matches!(self.kind, MountKind::Bind | MountKind::RecursiveBind)
+                && source_is_file(self.plan.c_str(self.op.source)?),
+        )
+    }
+
+    /// How to open the destination: what is there, or else what to make.
+    fn creation(&mut self) -> Result<Create> {
+        Ok(match self.existing()? {
+            Existing::File => Create::Nothing,
+            Existing::Nothing if self.wants_file()? => Create::File,
+            Existing::Directory | Existing::Nothing => Create::Directories,
+        })
+    }
+
     /// Moves a detached mount to its destination inside the container.
     fn attach(&mut self, source: BorrowedFd<'_>) -> Result<()> {
         if self.op.extra & mount_flag::DEST_NOFOLLOW != 0 {
@@ -869,14 +920,17 @@ impl Mount<'_> {
             self.resolver.invalidate(self.target);
             return Ok(());
         }
-        if self.create == Create::File {
-            let destination = self.resolver.open(self.target, Create::File)?;
-            move_onto(source, destination.as_fd(), "mount: attach")?;
-        } else {
-            let destination = self
-                .resolver
-                .open_directory(self.target, Create::Directories)?;
-            move_onto(source, destination, "mount: attach")?;
+        match self.creation()? {
+            Create::Directories => {
+                let destination = self
+                    .resolver
+                    .open_directory(self.target, Create::Directories)?;
+                move_onto(source, destination, "mount: attach")?;
+            }
+            create => {
+                let destination = self.resolver.open(self.target, create)?;
+                move_onto(source, destination.as_fd(), "mount: attach")?;
+            }
         }
         // The destination now names a different filesystem, so anything
         // cached for it or below it refers to what is hidden underneath.
@@ -901,7 +955,8 @@ impl Mount<'_> {
             ));
         }
 
-        let destination = self.resolver.open(self.target, self.create)?;
+        let create = self.creation()?;
+        let destination = self.resolver.open(self.target, create)?;
         let mut path = PathBuf::<64>::new();
         path.push_str("/proc/self/fd/")?;
         path.push_u64(u64::from(destination.as_raw_fd().unsigned_abs()))?;

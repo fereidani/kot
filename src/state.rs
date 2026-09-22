@@ -237,7 +237,10 @@ impl Store {
     ///
     /// The directory holds only what the store put there, so those are
     /// removed by name and the directory after them, without listing it.
-    /// One holding anything else is swept the general way.
+    /// The record is the one name that is always there; the temporary and
+    /// the fifo are unlinked only when the directory turns out not to be
+    /// empty without them, since a finished `run` never leaves either. One
+    /// holding anything else is swept the general way.
     pub fn remove(&self, id: &str) -> Result<()> {
         use rustix::fs::{AtFlags, unlinkat};
 
@@ -256,17 +259,26 @@ impl Store {
                 )));
             }
         };
-        for entry in [STATUS, TEMPORARY, FIFO] {
-            match unlinkat(&handle, entry, AtFlags::empty()) {
-                Ok(()) | Err(Errno::NOENT) => {}
-                Err(e) => {
-                    return Err(anyhow::Error::new(e)
-                        .context(format!("removing the state for {id}")));
+        let failed = || format!("removing the state for {id}");
+        match unlinkat(&handle, STATUS, AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => {}
+            Err(e) => return Err(anyhow::Error::new(e).context(failed())),
+        }
+        let mut removed =
+            unlinkat(rustix::fs::CWD, &directory, AtFlags::REMOVEDIR);
+        if removed == Err(Errno::NOTEMPTY) {
+            for entry in [TEMPORARY, FIFO] {
+                match unlinkat(&handle, entry, AtFlags::empty()) {
+                    Ok(()) | Err(Errno::NOENT) => {}
+                    Err(e) => {
+                        return Err(anyhow::Error::new(e).context(failed()));
+                    }
                 }
             }
+            removed = unlinkat(rustix::fs::CWD, &directory, AtFlags::REMOVEDIR);
         }
         drop(handle);
-        match unlinkat(rustix::fs::CWD, &directory, AtFlags::REMOVEDIR) {
+        match removed {
             Ok(()) | Err(Errno::NOENT) => Ok(()),
             Err(Errno::NOTEMPTY) => fs::remove_dir_all(&directory)
                 .with_context(|| {
