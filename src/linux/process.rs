@@ -20,7 +20,10 @@
 
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
-use rustix::process::Pid;
+use rustix::{
+    io::{FdFlags, fcntl_setfd},
+    process::Pid,
+};
 
 use crate::{
     linux::mount::{Create, create_at},
@@ -681,6 +684,21 @@ impl Command {
     pub fn exec(&self, program: BorrowedFd<'_>) -> Error {
         // SAFETY: both arrays are NUL terminated and point into the mapped
         // plan, which outlives the call because the call does not return.
+        let error = unsafe {
+            sys::fexecve(program, self.argv.as_ptr(), self.envp.as_ptr())
+        };
+        if error.errno() != crate::sys::error::ENOENT {
+            return error;
+        }
+        // A script is read by its interpreter through `/dev/fd/<number>`,
+        // which the kernel will not arrange for a descriptor that closes on
+        // the execution, and it says so with the errno of a program that is
+        // not there. Keeping it open is what an interpreted payload needs;
+        // a missing one fails the same way twice.
+        if fcntl_setfd(program, FdFlags::empty()).is_err() {
+            return error;
+        }
+        // SAFETY: as above.
         unsafe { sys::fexecve(program, self.argv.as_ptr(), self.envp.as_ptr()) }
     }
 }
@@ -721,6 +739,16 @@ fn home_of(passwd: &[u8], uid: u32) -> Option<&[u8]> {
     None
 }
 
+/// True when a descriptor names a regular file.
+///
+/// Opened with `O_PATH`, so this is the only way to tell what was resolved.
+fn is_regular_file(fd: BorrowedFd<'_>) -> bool {
+    use rustix::fs::{FileType, fstat};
+    fstat(fd).is_ok_and(|stat| {
+        FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+    })
+}
+
 /// Resolves the payload inside the container.
 ///
 /// A name with no separator is looked up along `PATH`, which the specification
@@ -734,9 +762,6 @@ pub fn resolve_program(command: &Command) -> Result<OwnedFd> {
 
     let program = command.program()?;
     let bytes = program.to_bytes();
-    if bytes.is_empty() {
-        return Err(Error::msg("process: args[0] is empty"));
-    }
 
     // `RESOLVE_IN_ROOT` makes the directory it resolves from the root of
     // the resolution, so an absolute path has to start at the container's
@@ -756,7 +781,7 @@ pub fn resolve_program(command: &Command) -> Result<OwnedFd> {
             Some(rest) => (root.as_fd(), Path::from(rest)?),
             None => (rustix::fs::CWD, Path::from(path.to_bytes())?),
         };
-        openat2(
+        let fd = openat2(
             at,
             path.as_c_str(),
             OFlags::PATH | OFlags::CLOEXEC,
@@ -767,10 +792,21 @@ pub fn resolve_program(command: &Command) -> Result<OwnedFd> {
             ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS,
         )
         .map_err(Error::from)
+        .context("process: open payload")?;
+        // A directory or a device is not a program. Refusing it here names
+        // the configuration rather than the syscall, and lets the search
+        // along `PATH` pass over a directory of the program's name.
+        if !is_regular_file(fd.as_fd()) {
+            return Err(Error::new(
+                crate::sys::error::EPERM,
+                "process: the payload is not a regular file",
+            ));
+        }
+        Ok(fd)
     };
 
     if bytes.contains(&b'/') {
-        return open(program).context("process: open payload");
+        return open(program);
     }
 
     let path = command.env("PATH").unwrap_or(

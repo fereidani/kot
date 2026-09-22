@@ -12,9 +12,10 @@ use crate::sys::error::{Context, Error, Result};
 
 /// Longest failure description a message carries.
 ///
-/// Descriptions are static strings chosen by the code that failed, so this is
-/// a cap on those rather than on anything a container controls.
-pub const CONTEXT_MAX: usize = 96;
+/// A description is a static string chosen by the code that failed, and may
+/// carry a name with it, such as the program that could not be run. The
+/// length is one byte on the wire, so this cannot grow past 255.
+pub const CONTEXT_MAX: usize = 224;
 
 /// What a message means.
 ///
@@ -150,6 +151,35 @@ impl Message {
         #[allow(clippy::cast_possible_truncation)]
         {
             message.context_len = len as u8;
+        }
+        message
+    }
+
+    /// A message reporting a failure that names what it was about.
+    ///
+    /// The name goes on the message rather than in the error, which carries
+    /// a static description alone. One that does not fit is left out, since
+    /// a truncated path reads as a different one, and so is one that is not
+    /// text, which would cost the description with it.
+    #[must_use]
+    pub fn failure_named(error: Error, name: &[u8]) -> Self {
+        let mut message = Self::failure(error);
+        if core::str::from_utf8(name).is_err() {
+            return message;
+        }
+        let at = usize::from(message.context_len);
+        let quoted = name.len() + 3;
+        let Some(room) = message.context.get_mut(at..at + quoted) else {
+            return message;
+        };
+        let (open, rest) = room.split_at_mut(2);
+        open.copy_from_slice(b" `");
+        let (middle, close) = rest.split_at_mut(name.len());
+        middle.copy_from_slice(name);
+        close.copy_from_slice(b"`");
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            message.context_len = (at + quoted) as u8;
         }
         message
     }

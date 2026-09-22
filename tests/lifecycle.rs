@@ -2209,6 +2209,11 @@ fn a_detached_container_does_not_hold_the_caller_output_open() {
     );
 }
 
+/// A bind of a file the container cannot reach lands on a file.
+///
+/// A bind source inside a user namespace may be a path only the runtime's
+/// own user can look at, so the driver opens it and hands the tree over. The
+/// kernel refuses to move a file onto a directory, so what is made at the
 /// destination has to match what is on its way there.
 #[test]
 fn a_bind_of_a_file_into_a_user_namespace_lands_on_a_file() {
@@ -2261,6 +2266,10 @@ fn a_bind_of_a_file_into_a_user_namespace_lands_on_a_file() {
     assert_eq!(stdout(&output).trim(), "kept");
 }
 
+/// A hard limit above the host's is raised for a container in a user
+/// namespace.
+///
+/// Raising a hard limit needs privilege that namespace does not hold, so
 /// the container cannot do it for itself.
 #[test]
 fn a_hard_limit_a_user_namespace_cannot_raise_is_raised_for_it() {
@@ -2301,6 +2310,9 @@ fn a_hard_limit_a_user_namespace_cannot_raise_is_raised_for_it() {
     assert_eq!(stdout(&output).trim(), wanted.to_string());
 }
 
+/// A limit lower than the runtime's own descriptor block still starts.
+///
+/// The runtime hands its descriptors over on numbers above what a container
 /// may ask to be limited to, so a limit applied before that fails it.
 #[test]
 fn a_limit_below_the_handoff_block_still_starts_in_a_user_namespace() {
@@ -2330,4 +2342,67 @@ fn a_limit_below_the_handoff_block_still_starts_in_a_user_namespace() {
     let output = bundle.runtime(&["run", &bundle.id()]);
     expect_ok("run", &output);
     assert_eq!(stdout(&output).trim(), "256");
+}
+
+/// A payload with an interpreter line runs through its interpreter.
+///
+/// The program is executed from a descriptor, which the interpreter opens
+/// as `/dev/fd/<number>`. The kernel refuses a script whose descriptor would
+/// close on the execution.
+#[test]
+fn a_script_payload_runs_through_its_interpreter() {
+    if !privileged() {
+        return;
+    }
+    let bundle = Bundle::new("script-payload", &["/script"]);
+    let script = bundle.path().join("rootfs").join("script");
+    std::fs::write(&script, "#!/usr/bin/sh\necho interpreted\n")
+        .expect("a script in the container");
+    std::fs::set_permissions(
+        &script,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("making the script executable");
+
+    let output = bundle.runtime(&["run", &bundle.id()]);
+    expect_ok("run", &output);
+    assert_eq!(stdout(&output).trim(), "interpreted");
+}
+
+/// A payload that is not a regular file is refused by name.
+///
+/// Executing a directory fails with a reason that describes the syscall
+/// rather than the configuration, which names nothing the caller wrote.
+#[test]
+fn a_payload_that_is_not_a_regular_file_is_refused() {
+    if !privileged() {
+        return;
+    }
+    let bundle = Bundle::new("directory-payload", &["/usr"]);
+    let output = bundle.runtime(&["run", &bundle.id()]);
+    assert!(!output.status.success(), "a directory is not a program");
+    let text = stderr(&output);
+    assert!(
+        text.contains("not a regular file") && text.contains("`/usr`"),
+        "the failure should name the payload: {text}"
+    );
+}
+
+/// A program name with nothing in it is reported as one that was not found.
+///
+/// An empty name resolves to nothing, the same as any other name that
+/// cannot be resolved.
+#[test]
+fn an_empty_program_name_is_not_found() {
+    if !privileged() {
+        return;
+    }
+    let bundle = Bundle::new("empty-payload", &[""]);
+    let output = bundle.runtime(&["run", &bundle.id()]);
+    assert!(!output.status.success(), "an empty name names nothing");
+    let text = stderr(&output);
+    assert!(
+        text.contains("not found"),
+        "the failure should say the payload was not found: {text}"
+    );
 }

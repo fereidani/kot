@@ -466,7 +466,10 @@ impl Init<'_> {
         // The payload has to be resolved before privilege is dropped, because
         // a program the container's user cannot read is still one the
         // configuration asked to run.
-        let program = process::resolve_program(&command)?;
+        let program = match process::resolve_program(&command) {
+            Ok(program) => program,
+            Err(error) => return self.report_payload(&command, error),
+        };
 
         // Installing a filter takes either `no_new_privs` or `CAP_SYS_ADMIN`.
         // A configuration asking for the first gets its filter as late as it
@@ -524,6 +527,23 @@ impl Init<'_> {
             error: command.exec(program),
             reported: false,
         })
+    }
+
+    /// Reports a payload that could not be resolved, naming it.
+    ///
+    /// The name is what a caller needs and what the error type cannot
+    /// carry, so it goes on the message to the driver. Reported here rather
+    /// than returned, since a returned error is sent where the name is out
+    /// of reach.
+    fn report_payload(
+        &self,
+        command: &process::Command,
+        error: Error,
+    ) -> Result<Failure> {
+        let name = command.program()?;
+        let message = Message::failure_named(error, name.to_bytes());
+        let reported = sync::send(self.socket, &message).is_ok();
+        Ok(Failure { error, reported })
     }
 
     /// Gives the payload a terminal.

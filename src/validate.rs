@@ -231,16 +231,6 @@ fn check_process(process: &spec::Process<'_>) -> Result<()> {
         "process.cwd {} must be an absolute path",
         process.cwd
     );
-    // Only the first entry has to say something: it names the program, and
-    // an empty name cannot be resolved. The rest are the program's own
-    // arguments, and an empty one is a value like any other.
-    ensure!(
-        process
-            .args
-            .first()
-            .is_none_or(|program| !program.is_empty()),
-        "process.args[0] names the program to run and must not be empty"
-    );
 
     // Two limits of the same kind describe the same file, and the one that
     // happened to be written last would decide it.

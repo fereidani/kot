@@ -209,6 +209,10 @@ pub fn close_runtime_block(preserved: usize) -> Result<()> {
 
 /// Moves the payload's program onto [`program_slot`], keeping close-on-exec.
 ///
+/// Kept, so the descriptor does not reach the payload. The exception is an
+/// interpreted payload, whose interpreter opens the program by the name the
+/// kernel gives the descriptor; the execution clears the flag for it.
+///
 /// Takes ownership because the original number is about to be swept away, and
 /// dropping the wrapper afterwards would close a descriptor already gone.
 pub fn park_program(program: OwnedFd, preserved: usize) -> Result<RawFd> {
