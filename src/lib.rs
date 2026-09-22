@@ -15,7 +15,7 @@ pub mod oci;
 pub mod seccomp;
 pub mod sys;
 
-mod cli;
+pub mod cli;
 mod commands;
 mod devices;
 mod driver;
@@ -24,14 +24,17 @@ mod features;
 mod file;
 mod hooks;
 mod image;
-mod json;
+pub mod json;
 pub mod log;
+pub mod rdt;
+pub mod report;
 mod seccomp_agent;
 mod state;
+pub mod stats;
 mod template;
 mod terminal;
 mod update;
-mod validate;
+pub mod validate;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,8 +47,29 @@ use crate::state::{Record, Status};
 #[global_allocator]
 static HEAP: sys::heap::Heap = sys::heap::Heap;
 
-/// Exit code for a runtime failure, as distinct from a payload's own status.
-pub const FAILURE: i32 = 255;
+/// Exit code for a runtime failure.
+pub const FAILURE: i32 = 1;
+
+/// Exit code for an `exec` that never reached the process it was asked to
+/// run.
+///
+/// `exec` exits with the status of the process it ran, so a failure of its
+/// own has to be told apart from every status that process could produce.
+/// This is the number callers already read as "the process did not run",
+/// which is why `exec` is the one command that does not use [`FAILURE`].
+pub const EXEC_FAILURE: i32 = 255;
+
+/// The code to exit with when a command line failed.
+///
+/// Reached only on the failure path, where parsing the arguments a second
+/// time costs nothing and keeps the decision in one place.
+#[must_use]
+pub fn failure_code(argv: &[String]) -> i32 {
+    match cli::parse(argv) {
+        Ok((_, cli::Command::Exec(_))) => EXEC_FAILURE,
+        _ => FAILURE,
+    }
+}
 
 /// Runs one command line and returns the code the caller should exit with.
 ///

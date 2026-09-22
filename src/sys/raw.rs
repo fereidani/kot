@@ -39,10 +39,12 @@ syscall_numbers! {
     DUP3 = "`dup3(2)`", 292, 24;
     EXECVEAT = "`execveat(2)`", 322, 281;
     IOPRIO_SET = "`ioprio_set(2)`", 251, 30;
+    IOCTL = "`ioctl(2)`", 16, 29;
     KEYCTL = "`keyctl(2)`", 250, 219;
     MOUNT_SETATTR = "`mount_setattr(2)`", 442, 442;
     PERSONALITY = "`personality(2)`", 135, 92;
     PRCTL = "`prctl(2)`", 157, 167;
+    SCHED_SETAFFINITY = "`sched_setaffinity(2)`", 203, 122;
     SCHED_SETATTR = "`sched_setattr(2)`", 314, 274;
     SECCOMP = "`seccomp(2)`", 317, 277;
     SETNS = "`setns(2)`", 308, 268;

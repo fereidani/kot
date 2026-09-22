@@ -122,6 +122,15 @@ pub enum Command {
         /// Generate a configuration for a container without privilege.
         rootless: bool,
     },
+    /// Report what a container is using, repeatedly or once.
+    Events {
+        /// Container identifier.
+        id: String,
+        /// Seconds between samples.
+        interval: u64,
+        /// Print one sample and stop.
+        once: bool,
+    },
     /// Report what this build supports.
     Features,
     /// Report the version.
@@ -136,6 +145,10 @@ pub enum Command {
 }
 
 /// Options shared by `create` and `run`.
+///
+/// Each boolean is a distinct command line flag, so they stay separate
+/// fields rather than becoming a word that call sites would have to decode.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Default)]
 pub struct Start {
     /// Container identifier.
@@ -154,6 +167,10 @@ pub struct Start {
     pub no_new_keyring: bool,
     /// Run in the background.
     pub detach: bool,
+    /// Configuration file to read instead of `config.json`.
+    pub config: Option<String>,
+    /// Keep the container's state after a foreground run ends.
+    pub keep: bool,
 }
 
 /// Options for `exec`.
@@ -221,17 +238,42 @@ pub struct Update {
 struct Args<'a> {
     words: &'a [String],
     index: usize,
+    /// The value half of a `--name=value` word, waiting to be read by the
+    /// option it was attached to.
+    attached: Option<&'a str>,
 }
 
 impl<'a> Args<'a> {
     const fn new(words: &'a [String]) -> Self {
-        Self { words, index: 0 }
+        Self {
+            words,
+            index: 0,
+            attached: None,
+        }
     }
 
     /// The next word, or nothing when the line is finished.
+    ///
+    /// A long option may carry its value in the same word, and the engines
+    /// that drive a runtime write it both ways. Splitting it here is what
+    /// lets every option below read its value the same way, whichever
+    /// spelling the caller used.
     fn word(&mut self) -> Option<&'a str> {
+        if let Some(value) = self.attached.take() {
+            // The option it was attached to does not take a value, so the
+            // value stands on its own and is read as the next word would
+            // be. That is the same line the caller wrote with a space, and
+            // it fails in the same way rather than being dropped.
+            return Some(value);
+        }
         let word = self.words.get(self.index)?;
         self.index += 1;
+        if word.starts_with("--") {
+            if let Some((name, value)) = word.split_once('=') {
+                self.attached = Some(value);
+                return Some(name);
+            }
+        }
         Some(word.as_str())
     }
 
@@ -240,7 +282,25 @@ impl<'a> Args<'a> {
         self.words.get(self.index..).unwrap_or(&[])
     }
 
-    /// The word after an option, which that option needs.
+    /// The word as the caller wrote it, with any attached value still part
+    /// of it.
+    ///
+    /// A word that is passed through to something else rather than read as
+    /// an option here has to go on exactly as it arrived: `--color=auto` is
+    /// one argument to the program a container runs, and handing that
+    /// program two would change what it was asked to do.
+    fn unsplit(&mut self, word: &'a str) -> &'a str {
+        if self.attached.take().is_none() {
+            return word;
+        }
+        self.index
+            .checked_sub(1)
+            .and_then(|at| self.words.get(at))
+            .map_or(word, String::as_str)
+    }
+
+    /// The value of an option, whether it was attached with `=` or written
+    /// as the word after it.
     fn value(&mut self, name: &str) -> Result<String> {
         self.word()
             .map(str::to_owned)
@@ -298,12 +358,21 @@ pub fn parse(argv: &[String]) -> Result<(Global, Command)> {
         },
         "update" => Command::Update(parse_update(rest)?),
         "spec" => parse_spec(rest)?,
+        "events" => parse_events(rest)?,
         "features" => Command::Features,
         "version" | "-v" | "-V" => Command::Version,
         "help" | "h" | "-h" => Command::Help,
         "__init" => Command::Init {
             args: rest.first().cloned().unwrap_or_default(),
         },
+        // Both are checkpoint and restore through CRIU, which this runtime
+        // does not carry and reports as unavailable in `features`. An
+        // operator who calls one is running an engine that needs it, and
+        // naming CRIU tells them which runtime to go back to.
+        "checkpoint" | "restore" => bail!(
+            "{name} needs CRIU, which this runtime does not implement; \
+             `kot features` reports checkpoint support as false"
+        ),
         other => bail!("unknown command: {other}"),
     };
     Ok((global, command))
@@ -428,6 +497,13 @@ fn parse_start(rest: &[String]) -> Result<Start> {
             "--no-pivot" => out.no_pivot = true,
             "--no-new-keyring" => out.no_new_keyring = true,
             "--detach" | "-d" => out.detach = true,
+            "--config" | "-f" => out.config = Some(args.value(argument)?),
+            "--keep" => out.keep = true,
+            // Accepted and ignored: this runtime does not reparent the
+            // processes a container leaves behind, so there is no subreaper
+            // to turn off, and refusing the flag would stop a command line
+            // that asks for exactly what already happens.
+            "--no-subreaper" => {}
             other if other.starts_with('-') => {
                 bail!("unknown option: {other}");
             }
@@ -490,7 +566,12 @@ fn parse_ps(rest: &[String]) -> Result<Command> {
             other if id.is_none() && !other.starts_with('-') => {
                 id = Some(other.to_owned());
             }
-            other => extra.push(other.to_owned()),
+            // Everything else is the caller's own argument to `ps`, and
+            // goes on as it was written.
+            other => {
+                let whole = args.unsplit(other).to_owned();
+                extra.push(whole);
+            }
         }
     }
     let id = id.ok_or_else(|| anyhow::anyhow!("ps needs a container id"))?;
@@ -553,6 +634,7 @@ fn parse_exec(rest: &[String]) -> Result<Exec> {
             || !out.args.is_empty()
             || (!out.id.is_empty() && !argument.starts_with('-'));
         if in_command {
+            let argument = args.unsplit(argument);
             if out.id.is_empty() {
                 argument.clone_into(&mut out.id);
             } else {
@@ -620,6 +702,7 @@ Commands:
   pause     stop every process in a container
   resume    let a paused container run again
   update    change a running container's resource limits
+  events    report what a container is using
   spec      write a starting configuration
   features  report what this build supports
 
@@ -633,3 +716,34 @@ Global options:
   --cgroup-manager NAME   cgroupfs, systemd or disabled
   --version               report the version
 ";
+
+/// Parses `events`.
+///
+/// The default is a sample every five seconds, the interval a supervisor
+/// polling a container expects when it names no interval.
+fn parse_events(rest: &[String]) -> Result<Command> {
+    /// Seconds between samples when the caller names none.
+    const DEFAULT_INTERVAL: u64 = 5;
+
+    let mut id = String::new();
+    let mut interval = DEFAULT_INTERVAL;
+    let mut once = false;
+    let mut args = Args::new(rest);
+    while let Some(argument) = args.word() {
+        match argument {
+            "--interval" => interval = args.number(argument)?,
+            "--stats" => once = true,
+            other if other.starts_with('-') => {
+                bail!("unknown option: {other}");
+            }
+            other => other.clone_into(&mut id),
+        }
+    }
+    if id.is_empty() {
+        bail!("a container id is required");
+    }
+    if interval == 0 {
+        bail!("--interval needs a number of seconds above zero");
+    }
+    Ok(Command::Events { id, interval, once })
+}

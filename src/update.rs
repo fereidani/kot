@@ -14,8 +14,12 @@ use crate::{cli::Update, oci::json::Parser, state::Store};
 
 /// Applies new limits to a running container.
 pub fn run(store: &Store, options: &Update) -> Result<i32> {
+    // The command line is checked before the container is looked up: an
+    // option this runtime cannot honour is the caller's mistake whether or
+    // not the container they named exists, and reporting the container
+    // first would hide it.
+    let (text, schema) = collect(options)?;
     let record = store.load_running(&options.id)?;
-    let text = collect(options)?;
     let arena = Bump::new();
     let mut parser = Parser::new(text.as_bytes(), &arena);
     let resources = crate::oci::parse::resources(&mut parser)
@@ -25,11 +29,28 @@ pub fn run(store: &Store, options: &Update) -> Result<i32> {
     manager
         .apply(Some(&resources))
         .context("applying the new limits")?;
+
+    // The cache and bandwidth allocation lives in a filesystem of its own,
+    // and the container is already in a class there. A caller changing the
+    // schema is changing that class, which is why the container has to have
+    // been given one when it was created.
+    if !schema.is_empty() {
+        if record.rdt_class.is_empty() {
+            bail!(
+                "container {} was not created with a cache or bandwidth \
+                 allocation, so there is no class to change",
+                options.id
+            );
+        }
+        let lines = format!("{}\n", schema.join("\n"));
+        crate::rdt::reschedule(std::path::Path::new(&record.rdt_class), &lines)
+            .context("changing the cache and bandwidth allocation")?;
+    }
     Ok(0)
 }
 
 /// Produces the resources fragment to apply.
-fn collect(options: &Update) -> Result<String> {
+fn collect(options: &Update) -> Result<(String, Vec<String>)> {
     if let Some(source) = options.resources.as_deref() {
         let text = if source == "-" {
             let mut text = String::new();
@@ -42,12 +63,14 @@ fn collect(options: &Update) -> Result<String> {
                 format!("reading the new limits from {source}")
             })?
         };
-        return Ok(unwrap_fragment(&text));
+        return Ok((unwrap_fragment(&text), Vec::new()));
     }
 
     let mut memory = Vec::new();
     let mut cpu = Vec::new();
     let mut pids = Vec::new();
+    let mut block_io = Vec::new();
+    let mut schema: Vec<String> = Vec::new();
     for (name, value) in &options.values {
         match name.as_str() {
             "memory" => memory.push(("limit", value.clone())),
@@ -55,6 +78,20 @@ fn collect(options: &Update) -> Result<String> {
                 memory.push(("reservation", value.clone()));
             }
             "memory-swap" => memory.push(("swap", value.clone())),
+            // The unified hierarchy accounts kernel memory against the same
+            // limit and the lowering refuses these there, which is the
+            // honest answer. On the legacy hierarchy they are real files and
+            // a caller adjusting them should not have to write a fragment by
+            // hand to reach them.
+            "kernel-memory" => memory.push(("kernel", value.clone())),
+            "kernel-memory-tcp" => memory.push(("kernelTCP", value.clone())),
+            "cpu-idle" => cpu.push(("idle", value.clone())),
+            "blkio-weight" => block_io.push(("weight", value.clone())),
+            // The cache and bandwidth allocation is not a cgroup file, so
+            // it is collected here and applied separately below.
+            "l3-cache-schema" | "mem-bw-schema" => {
+                schema.push(value.clone());
+            }
             "cpu-share" | "cpu-shares" => cpu.push(("shares", value.clone())),
             "cpu-period" => cpu.push(("period", value.clone())),
             "cpu-quota" => cpu.push(("quota", value.clone())),
@@ -69,8 +106,12 @@ fn collect(options: &Update) -> Result<String> {
     }
 
     let mut parts = Vec::new();
-    for (name, fields) in [("memory", &memory), ("cpu", &cpu), ("pids", &pids)]
-    {
+    for (name, fields) in [
+        ("memory", &memory),
+        ("cpu", &cpu),
+        ("pids", &pids),
+        ("blockIO", &block_io),
+    ] {
         if fields.is_empty() {
             continue;
         }
@@ -80,7 +121,7 @@ fn collect(options: &Update) -> Result<String> {
             .collect();
         parts.push(format!("\"{name}\": {{{}}}", body.join(", ")));
     }
-    Ok(format!("{{{}}}", parts.join(", ")))
+    Ok((format!("{{{}}}", parts.join(", ")), schema))
 }
 
 /// Accepts both a bare resources object and a whole configuration.

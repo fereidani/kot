@@ -106,6 +106,25 @@ pub fn adopt(follower: BorrowedFd<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Gives the container's end of the terminal to the user the payload runs
+/// as.
+///
+/// A terminal device is created owned by whoever opened it, which here is
+/// init while it is still privileged. A payload running as anybody else
+/// would then find its own standard input and output owned by somebody it
+/// is not, and a mode that grants nothing to others: it could not read a
+/// keystroke or print a line. This runs before privilege is dropped, which
+/// is the only moment it can.
+pub fn own(follower: BorrowedFd<'_>, uid: u32, gid: u32) -> Result<()> {
+    use rustix::{
+        fs::fchown,
+        process::{Gid, Uid},
+    };
+
+    fchown(follower, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+        .context("terminal: give the container end to its user")
+}
+
 /// Sets a terminal's size.
 pub fn resize(terminal: BorrowedFd<'_>, rows: u32, columns: u32) -> Result<()> {
     if rows == 0 && columns == 0 {

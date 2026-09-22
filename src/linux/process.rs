@@ -240,14 +240,20 @@ pub fn drop_privileges(plan: &View<'_>, process: &Process) -> Result<()> {
         let groups: Vec<Gid> = gids.into_iter().map(Gid::from_raw).collect();
         match set_thread_groups(&groups) {
             Ok(()) => {}
-            // An unprivileged user namespace refuses `setgroups` outright, and
-            // the driver already wrote `deny` to say so. Failing here would
-            // stop every rootless container.
+            // A user namespace whose gid map had to be written with
+            // `setgroups` denied refuses the call outright. Where the
+            // configuration named no groups that changes nothing, and
+            // failing would stop every rootless container for a call it
+            // never needed to make.
             Err(e)
-                if matches!(
-                    e.raw_os_error(),
-                    crate::sys::error::EPERM | crate::sys::error::EINVAL
-                ) => {}
+                if groups.is_empty()
+                    && matches!(
+                        e.raw_os_error(),
+                        crate::sys::error::EPERM | crate::sys::error::EINVAL
+                    ) => {}
+            // Where it did name groups, they are access the container was
+            // meant to have. Carrying on would start it with an identity
+            // the configuration did not describe and nothing to say so.
             Err(e) => {
                 return Err(Error::from(e).describe("process: set groups"));
             }
@@ -291,6 +297,9 @@ pub fn apply_capabilities(process: &Process) -> Result<()> {
     crate::sys::caps::apply(&sets)
 }
 
+/// The magic number `statfs` reports for the kernel's process filesystem.
+const PROC_SUPER_MAGIC: rustix::fs::FsWord = 0x0000_9fa0;
+
 /// Applies the mandatory access control labels.
 ///
 /// Both are written through `/proc/self`, and both only take effect at the
@@ -327,8 +336,27 @@ fn write_label(
         return Ok(());
     }
     let value = plan.raw(label)?;
-    let file = open(path, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty())
-        .context(failure)?;
+    let file = open(
+        path,
+        OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .context(failure)?;
+
+    // The label is written to a file in `/proc`, and by this point the
+    // container's own mounts are in place. A configuration can mount
+    // anything anywhere, including a writable filesystem of its own over
+    // the path below: the write would then succeed against an ordinary
+    // file, the runtime would report the label applied, and the payload
+    // would run with no confinement at all. Only the kernel's own
+    // filesystem can carry these attributes, so anything else is refused.
+    let kind = rustix::fs::fstatfs(&file).context(failure)?;
+    if kind.f_type != PROC_SUPER_MAGIC {
+        return Err(Error::msg(
+            "process: the label attribute is not on the kernel's own \
+             filesystem",
+        ));
+    }
 
     let mut buffer = PathBuf::<512>::new();
     buffer.push_str(prefix)?;

@@ -10,10 +10,10 @@ use std::os::fd::{BorrowedFd, OwnedFd};
 
 use crate::{
     linux::handoff::Slot,
-    oci::plan::{Section, View, record::IdRange},
+    oci::plan::{Container, Section, View, record::IdRange},
     sys::{
-        clone::{CLONE_NEWPID, CLONE_NEWUSER},
-        error::{Context, Error, Result},
+        clone::{CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER},
+        error::{Context, EPERM, Error, Result},
         path::{Path, PathBuf},
         process::setns,
     },
@@ -45,9 +45,11 @@ pub fn join(plan: &View<'_>) -> Result<bool> {
 
 /// Creates the namespaces that could not be made at clone time.
 ///
-/// Returns true when a pid namespace was among them, which means the caller
-/// has to fork once more: `unshare` puts the caller's *children* in the new
-/// pid namespace, not the caller.
+/// Returns true when the caller has to fork once more, which is the case for
+/// a pid namespace and for a time namespace alike: `unshare` puts the
+/// caller's *children* in either of those, never the caller. A container
+/// left in the parent of the namespace it asked for would see the host's
+/// process numbers, or the host's clocks.
 pub fn unshare(flags: u64) -> Result<bool> {
     use rustix::thread::{UnshareFlags, unshare_unsafe};
 
@@ -61,7 +63,7 @@ pub fn unshare(flags: u64) -> Result<bool> {
     // nothing else in it can observe the namespace change half applied.
     unsafe { unshare_unsafe(UnshareFlags::from_bits_retain(bits)) }
         .context("namespace: unshare")?;
-    Ok(flags & CLONE_NEWPID != 0)
+    Ok(flags & (CLONE_NEWPID | CLONE_NEWTIME) != 0)
 }
 
 /// Whether a container ends up in a user namespace the runtime created.
@@ -78,17 +80,98 @@ pub const fn creates_user_namespace(
 /// The process cannot write these itself: the kernel requires the writer to
 /// hold privilege in the *parent* namespace, which is exactly what the process
 /// gave up by entering the new one. That is why this runs in the driver.
-pub fn write_id_maps(plan: &View<'_>, pid: i32) -> Result<()> {
+pub fn write_id_maps(
+    plan: &View<'_>,
+    pid: i32,
+    may_deny_setgroups: bool,
+) -> Result<()> {
     if plan.count(Section::UidMap) == 0 && plan.count(Section::GidMap) == 0 {
         return Ok(());
     }
-    // The kernel refuses a gid map from a process that could still call
-    // `setgroups`, unless it holds `CAP_SETGID` outside the namespace. Denying
-    // it first is how an unprivileged mapping becomes possible at all.
-    let _ = write_proc(pid, "setgroups", b"deny");
+    match write_map(plan, pid, Section::UidMap, "uid_map") {
+        Ok(()) => {}
+        // An unprivileged caller may write only its own id directly.
+        // Anything wider is what the subordinate ranges an administrator
+        // granted are for, and the helper is installed to write those.
+        Err(e) if e.errno() == EPERM => {
+            run_id_helper(plan, pid, Section::UidMap, "newuidmap")?;
+        }
+        Err(e) => return Err(e),
+    }
 
-    write_map(plan, pid, Section::UidMap, "uid_map")?;
+    // The gid map is tried as the runtime stands. A writer holding
+    // `CAP_SETGID` outside the namespace is allowed it, and the container
+    // then keeps the ability to set supplementary groups, which is what a
+    // configuration naming `additionalGids` needs.
+    match write_map(plan, pid, Section::GidMap, "gid_map") {
+        Ok(()) => return Ok(()),
+        Err(e) if e.errno() == EPERM => {
+            // The helper writes it with privilege of its own, so the
+            // container keeps `setgroups` where this succeeds.
+            if run_id_helper(plan, pid, Section::GidMap, "newgidmap").is_ok() {
+                return Ok(());
+            }
+            if !may_deny_setgroups {
+                return Err(e);
+            }
+        }
+        Err(e) => return Err(e),
+    }
+
+    // Without that privilege the kernel takes the map only from a process
+    // that can no longer call `setgroups`, so denying it is the price of
+    // having a mapping at all. The container cannot have supplementary
+    // groups after this, and the code that would set them says so rather
+    // than dropping them quietly.
+    write_proc(pid, "setgroups", b"deny")?;
     write_map(plan, pid, Section::GidMap, "gid_map")
+}
+
+/// Writes the clock offsets of the time namespace this process just made.
+///
+/// A new time namespace starts with both of its clocks reading exactly what
+/// the host's do, and the offsets are what the configuration asked for
+/// instead. The kernel fixes them the moment anything is in the namespace,
+/// and `unshare` leaves the caller outside the one it creates, so this is
+/// the only moment they can be written: after the unshare and before the
+/// fork that puts the container inside.
+pub fn write_time_offsets(container: &Container) -> Result<()> {
+    if !container.set_boottime && !container.set_monotonic {
+        return Ok(());
+    }
+    // One write for the whole file, as with the id maps: the kernel takes
+    // each line as a record and a half-written set would leave the container
+    // on a clock nobody asked for.
+    let mut body = Path::new();
+    let clocks = [
+        (
+            "boottime",
+            container.set_boottime,
+            container.boottime_secs,
+            container.boottime_nanos,
+        ),
+        (
+            "monotonic",
+            container.set_monotonic,
+            container.monotonic_secs,
+            container.monotonic_nanos,
+        ),
+    ];
+    for (clock, wanted, secs, nanos) in clocks {
+        if !wanted {
+            continue;
+        }
+        body.push_str(clock)?;
+        body.push_str(" ")?;
+        body.push_i64(secs)?;
+        body.push_str(" ")?;
+        body.push_u64(u64::from(nanos))?;
+        body.push_str("\n")?;
+    }
+    // This process's own file, not a child's: it has unshared the namespace
+    // and is therefore still outside it, which is the only state the kernel
+    // lets the clocks be set from.
+    write_own_proc("timens_offsets", body.as_bytes())
 }
 
 fn write_map(
@@ -325,4 +408,64 @@ pub unsafe fn slot(slot: Slot) -> BorrowedFd<'static> {
     // SAFETY: the caller guarantees the descriptor is present, and the
     // returned borrow names a number this process owns for its whole life.
     unsafe { BorrowedFd::borrow_raw(slot.fd()) }
+}
+
+/// Writes a mapping through the setuid helper an unprivileged caller needs.
+///
+/// A caller without privilege may map only its own id by writing the file
+/// itself. Anything wider needs the subordinate ranges an administrator
+/// granted it, and the two helpers are installed setuid for exactly that:
+/// they check the ranges asked for against what was granted and write the
+/// map with the privilege the caller does not have. Without them a rootless
+/// container has one id and no more, which is not enough for an image whose
+/// files belong to several.
+///
+/// Runs in the driver, on a process that is waiting, so spawning a program
+/// here costs nothing the container is waiting on twice.
+fn run_id_helper(
+    plan: &View<'_>,
+    pid: i32,
+    section: Section,
+    program: &str,
+) -> Result<()> {
+    let mut command = std::process::Command::new(program);
+    command.arg(pid.to_string());
+    plan.id_map(section, |range: IdRange| {
+        command.arg(range.container_id.to_string());
+        command.arg(range.host_id.to_string());
+        command.arg(range.size.to_string());
+        Ok(())
+    })?;
+
+    let status = command.status().map_err(|_| {
+        Error::msg("namespace: the id mapping helper is absent")
+    })?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(Error::msg(
+        "namespace: the id mapping helper refused the ranges",
+    ))
+}
+
+/// Writes one of this process's own files under `/proc`.
+fn write_own_proc(file: &str, value: &[u8]) -> Result<()> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let mut path = Path::new();
+    path.push_str("/proc/self/")?;
+    path.push_str(file)?;
+    let fd = open(
+        path.as_c_str(),
+        OFlags::WRONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .context("namespace: open the clock offsets")?;
+    let written = rustix::io::write(&fd, value)
+        .context("namespace: write the clock offsets")?;
+    if written == value.len() {
+        Ok(())
+    } else {
+        Err(Error::msg("namespace: short write of the clock offsets"))
+    }
 }

@@ -312,3 +312,124 @@ pub fn set_mempolicy(mode: u32, nodes: &[u64], max_node: u64) -> Result<()> {
     };
     ret_unit(r, "set_mempolicy")
 }
+
+/// The highest CPU number an affinity mask here can name.
+///
+/// The kernel's own set grows with the machine, but a runtime that has to
+/// keep its stack bounded cannot follow it. A thousand and twenty-four is
+/// the width the C library has used for decades and more than any host this
+/// runtime targets; a configuration naming a higher CPU is refused rather
+/// than silently confined to the ones that fit.
+pub const MAX_CPUS: usize = 1024;
+
+/// How many words the mask takes.
+const AFFINITY_WORDS: usize = MAX_CPUS / 64;
+
+/// A set of CPUs, laid out the way `sched_setaffinity` reads it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CpuSet {
+    words: [u64; AFFINITY_WORDS],
+}
+
+impl Default for CpuSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CpuSet {
+    /// An empty set.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            words: [0; AFFINITY_WORDS],
+        }
+    }
+
+    /// Adds one CPU to the set.
+    pub fn add(&mut self, cpu: usize) -> Result<()> {
+        let Some(word) = self.words.get_mut(cpu / 64) else {
+            return Err(Error::msg("affinity: CPU number out of range"));
+        };
+        *word |= 1u64 << (cpu % 64);
+        Ok(())
+    }
+
+    /// Whether the set names `cpu`.
+    #[must_use]
+    pub fn contains(&self, cpu: usize) -> bool {
+        self.words
+            .get(cpu / 64)
+            .is_some_and(|word| word & (1u64 << (cpu % 64)) != 0)
+    }
+
+    /// Whether the set names nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.words.iter().all(|word| *word == 0)
+    }
+
+    /// Parses the list form the configuration states, such as `0-3,8`.
+    ///
+    /// An empty set is refused: a process has to be able to run somewhere,
+    /// and the kernel rejects the call anyway, later and less clearly.
+    pub fn parse(list: &str) -> Result<Self> {
+        let mut set = Self::new();
+        // Bounded by the text: each iteration consumes one comma-separated
+        // item, and there are fewer of those than there are characters.
+        for item in list.split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let (low, high) = if let Some((low, high)) = item.split_once('-') {
+                (parse_cpu(low)?, parse_cpu(high)?)
+            } else {
+                let only = parse_cpu(item)?;
+                (only, only)
+            };
+            if high < low {
+                return Err(Error::msg(
+                    "affinity: range ends before it starts",
+                ));
+            }
+            for cpu in low..=high {
+                set.add(cpu)?;
+            }
+        }
+        if set.is_empty() {
+            return Err(Error::msg("affinity: names no CPU at all"));
+        }
+        Ok(set)
+    }
+}
+
+/// Parses one CPU number, refusing anything the mask cannot hold.
+fn parse_cpu(text: &str) -> Result<usize> {
+    let cpu: usize = text
+        .trim()
+        .parse()
+        .map_err(|_| Error::msg("affinity: expected a CPU number"))?;
+    if cpu >= MAX_CPUS {
+        return Err(Error::msg("affinity: CPU number out of range"));
+    }
+    Ok(cpu)
+}
+
+/// Confines a process to `set`, or the calling thread when `pid` is zero.
+///
+/// The set is inherited across `execve`, which is what lets the runtime
+/// place a process before handing it the program it was asked to run.
+pub fn set_affinity(pid: i32, set: &CpuSet) -> Result<()> {
+    // SAFETY: the kernel reads `size` bytes from the mask, and `size` is that
+    // array's own length in bytes. The array outlives the call.
+    let r = unsafe {
+        syscall3(
+            nr::SCHED_SETAFFINITY,
+            arg_i32(pid),
+            core::mem::size_of_val(&set.words),
+            arg_ref(&set.words),
+        )
+    };
+    ret_unit(r, "sched_setaffinity")
+}

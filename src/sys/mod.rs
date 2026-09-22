@@ -23,6 +23,7 @@ pub mod clone;
 pub mod error;
 pub mod heap;
 pub mod mountattr;
+pub mod net;
 pub mod path;
 pub mod prctl;
 pub mod process;

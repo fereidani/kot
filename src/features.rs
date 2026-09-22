@@ -138,6 +138,28 @@ fn systemd_available() -> bool {
     path_exists("/run/systemd/private") || path_exists("/run/systemd/system")
 }
 
+/// The NUMA policy modes a configuration may name.
+///
+/// Listed here and resolved in the lowering tables; the two are checked
+/// against each other by a test, because a mode reported and not accepted
+/// is worse than one that was never advertised.
+const MEMORY_POLICY_MODES: [&str; 7] = [
+    "MPOL_DEFAULT",
+    "MPOL_BIND",
+    "MPOL_INTERLEAVE",
+    "MPOL_WEIGHTED_INTERLEAVE",
+    "MPOL_PREFERRED",
+    "MPOL_PREFERRED_MANY",
+    "MPOL_LOCAL",
+];
+
+/// The NUMA policy flags a configuration may name.
+const MEMORY_POLICY_FLAGS: [&str; 3] = [
+    "MPOL_F_NUMA_BALANCING",
+    "MPOL_F_RELATIVE_NODES",
+    "MPOL_F_STATIC_NODES",
+];
+
 /// The `linux` half of the report.
 ///
 /// Split out because it is most of the document: everything the kernel
@@ -206,8 +228,21 @@ fn linux_section(json: &mut Writer) {
     json.end_object();
     json.end_object();
 
+    // Implemented, so it is reported. A caller that probes for it and finds
+    // nothing has to assume it is absent and either refuse a configuration
+    // that would have worked or apply it and hope.
+    json.object(Some("memoryPolicy"));
+    json.boolean(Some("enabled"), true);
+    json.string_array("modes", MEMORY_POLICY_MODES);
+    json.string_array("flags", MEMORY_POLICY_FLAGS);
+    json.end_object();
+
+    // Checked against the host rather than against what was compiled in:
+    // the allocation needs hardware support and an administrator who
+    // mounted the filesystem, and a caller told otherwise would send a
+    // configuration that cannot be applied.
     json.object(Some("intelRdt"));
-    json.boolean(Some("enabled"), false);
+    json.boolean(Some("enabled"), crate::rdt::available());
     json.end_object();
 
     json.object(Some("netDevices"));

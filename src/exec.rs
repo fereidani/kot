@@ -93,7 +93,33 @@ pub fn run(store: &Store, options: &Exec) -> Result<i32> {
     // only be reported as an exit code.
     View::new(&lowered.arena)?;
 
-    spawn(store, options, &record, &lowered)
+    // The affinity the specification states for an exec process, read here
+    // where the configuration is still in scope. The two halves are applied
+    // on either side of the cgroup placement, the only thing separating
+    // them.
+    let affinity = spec
+        .process
+        .as_ref()
+        .and_then(|process| process.exec_cpu_affinity.as_ref())
+        .map(|affinity| Affinity {
+            initial: affinity.initial.map(str::to_owned),
+            final_set: affinity.final_set.map(str::to_owned),
+        })
+        .unwrap_or_default();
+
+    spawn(store, options, &record, &lowered, &affinity)
+}
+
+/// What the configuration says an exec process may run on.
+///
+/// Owned rather than borrowed because it outlives the arena the
+/// configuration was parsed into.
+#[derive(Default)]
+struct Affinity {
+    /// Applied before the process is placed in the container's cgroup.
+    initial: Option<String>,
+    /// Applied after it, and inherited by the program it runs.
+    final_set: Option<String>,
 }
 
 /// Replaces the configuration's process section with what `exec` was given.
@@ -151,15 +177,7 @@ fn apply_overrides<'a>(
         let capabilities =
             process.capabilities.get_or_insert_with(Default::default);
         for name in &options.caps {
-            let stored: &'a str = arena.alloc_str(name);
-            for set in [
-                &mut capabilities.bounding,
-                &mut capabilities.effective,
-                &mut capabilities.permitted,
-                &mut capabilities.inheritable,
-            ] {
-                set.get_or_insert_with(Vec::new).push(stored);
-            }
+            capabilities.grant(arena.alloc_str(name));
         }
     }
     Ok(())
@@ -235,6 +253,7 @@ fn spawn(
     options: &Exec,
     record: &Record,
     lowered: &lower::Lowered,
+    affinity: &Affinity,
 ) -> Result<i32> {
     // A process run inside a container belongs in the container's cgroup, or
     // it escapes every limit the container has. The cgroup is opened before
@@ -281,7 +300,7 @@ fn spawn(
         prepared: (),
         in_cgroup,
     } = driver::spawn_sealed(&process, prepare)?;
-    supervise(options, &mut manager, socket, pid, in_cgroup)
+    supervise(options, &mut manager, socket, pid, in_cgroup, affinity)
 }
 
 /// Drives the handshake and waits for the process.
@@ -292,6 +311,7 @@ fn supervise(
     socket: OwnedFd,
     pid: i32,
     in_cgroup: bool,
+    affinity: &Affinity,
 ) -> Result<i32> {
     // As in `create`: the id the process reports is the one it sees inside
     // the container, so what the runtime acts on is the clone's own answer.
@@ -302,6 +322,12 @@ fn supervise(
         "waiting for the process to be prepared",
     )?;
 
+    // The affinity the process starts under, before it is placed: the
+    // specification states these two separately because placement itself
+    // can change what a process may run on, through a cpuset.
+    driver::apply_affinity(affinity.initial.as_deref(), pid)
+        .context("applying the initial CPU affinity")?;
+
     // Only a process the clone could not place needs moving. The only way to
     // reach the error is a placement that was asked for and did not happen.
     if !in_cgroup {
@@ -310,6 +336,11 @@ fn supervise(
             .add_process_in(pid, sub)
             .context("placing the process in the container's cgroup")?;
     }
+
+    // And the affinity it runs the caller's program under, which the
+    // program inherits through `execve`.
+    driver::apply_affinity(affinity.final_set.as_deref(), pid)
+        .context("applying the CPU affinity for the process")?;
 
     sync::send(socket.as_fd(), &Message::new(Kind::Proceed))?;
 

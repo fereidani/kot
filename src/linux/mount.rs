@@ -6,10 +6,13 @@
 //! mappings. The older `mount(2)` path is kept for hosts without it, selected
 //! once by a probe rather than per mount.
 //!
-//! Destinations are resolved with `openat2` under `RESOLVE_IN_ROOT`, so the
-//! kernel does the confinement and there is no window between checking a path
-//! and using it. That is the whole of the defence against the symlink and
-//! mount races that have been the recurring bug class here.
+//! Destinations are resolved with `openat2` under `RESOLVE_BENEATH` and
+//! `RESOLVE_NO_MAGICLINKS`, relative to a descriptor for the container's
+//! root, so the kernel does the confinement and there is no window between
+//! checking a path and using it. That is the whole of the defence against the
+//! symlink and mount races that have been the recurring bug class here, and
+//! it is why the older `mount(2)` path above is a fallback for the mount API
+//! alone: `openat2` is required either way.
 
 use core::ffi::CStr;
 use std::{
@@ -418,14 +421,33 @@ pub(crate) fn create_at(
         Create::Directories => {
             mkdirat(parent, name, Mode::from_raw_mode(0o755))
         }
+        // The final component is the one part of this path the image
+        // controls: everything above it was resolved under `RESOLVE_BENEATH`
+        // already. Without `O_NOFOLLOW` a symlink the image leaves there is
+        // followed, and the file prepared as a mount destination is created
+        // wherever it points, outside the container's root and with the
+        // runtime's privileges rather than the container's.
         Create::File => openat(
             parent,
             name,
-            OFlags::CREATE | OFlags::WRONLY | OFlags::CLOEXEC,
+            OFlags::CREATE
+                | OFlags::WRONLY
+                | OFlags::NOFOLLOW
+                | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o644),
         )
         .map(|_| ()),
     };
+    // A destination that is already a symbolic link fails the open above
+    // rather than being followed, and it is worth saying which of the two
+    // things went wrong.
+    if let Err(e) = &made {
+        if e.raw_os_error() == crate::sys::error::ELOOP {
+            return Err(Error::msg(
+                "mount: the destination in the image is a symbolic link",
+            ));
+        }
+    }
     ok_if_exists(made, context)
 }
 

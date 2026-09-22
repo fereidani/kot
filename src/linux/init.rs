@@ -22,7 +22,7 @@ use crate::{
     },
     oci::plan::{Container, Process, View, process_flag},
     sys::{
-        clone::{CloneSpec, Fork},
+        clone::{CLONE_NEWNET, CloneSpec, Fork},
         error::{Context, Error, Result},
         prctl,
         seccomp::SockFilter,
@@ -90,8 +90,15 @@ fn attempt(args: &InitArgs, socket: BorrowedFd<'_>) -> Result<Failure> {
     // caller, so without it an `exec` would run beside the container with the
     // container's filesystem, seeing process numbers that mean nothing there.
     let joined_pid = namespace::join(&plan)?;
-    let needs_fork =
-        namespace::unshare(init.container.unshare_flags)? || joined_pid;
+    let unshared = namespace::unshare(init.container.unshare_flags)?;
+
+    // The clocks of a new time namespace can be set only while nothing is
+    // in it. `unshare` leaves this process outside the namespace it just
+    // made and puts its children there instead, so this is the one moment
+    // between the namespace existing and the container being in it.
+    namespace::write_time_offsets(&init.container)?;
+
+    let needs_fork = unshared || joined_pid;
     if needs_fork {
         return init.fork_into_pid_namespace();
     }
@@ -174,6 +181,18 @@ impl Init<'_> {
             rootfs::apply_names(self.plan, &self.container)?;
             if self.container.new_keyring {
                 namespace::new_session_keyring("container")?;
+            }
+            // A network namespace is made with its loopback device down, so
+            // a container in a fresh one cannot reach itself until somebody
+            // brings it up. Nothing else will: an engine configures
+            // addresses and routes through a hook or a plugin, and a
+            // container that has only a loopback device would get neither.
+            // A namespace the configuration joined is left alone, since its
+            // interfaces are in whatever state its owner chose.
+            let created =
+                self.container.clone_flags | self.container.unshare_flags;
+            if created & CLONE_NEWNET != 0 {
+                crate::sys::net::bring_up_loopback()?;
             }
         }
 
@@ -261,6 +280,11 @@ impl Init<'_> {
         } else {
             rootfs::pivot(root.as_fd())?;
         }
+        // Now that the container's root is the root, it can be given the
+        // propagation the configuration asked for. Doing it before the
+        // change would have sent everything above back out through the
+        // mount the bundle sits on.
+        rootfs::apply_propagation(container)?;
 
         // Every cached directory descriptor now names a path in the old root,
         // so the resolver starts again from the new one.
@@ -399,6 +423,7 @@ impl Init<'_> {
             ));
         }
         let (controller, follower) = terminal::open()?;
+        terminal::own(follower.as_fd(), self.payload.uid, self.payload.gid)?;
         terminal::resize(
             controller.as_fd(),
             self.payload.console_height,

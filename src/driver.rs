@@ -91,8 +91,12 @@ pub fn create(
         format!("resolving the bundle directory {}", options.bundle)
     })?;
     let mut config = Vec::new();
-    crate::file::read(&bundle.join("config.json"), &mut config)
-        .with_context(|| format!("reading {}/config.json", bundle.display()))?;
+    // A caller may keep several configurations in one bundle and name the
+    // one it wants, which is how a single rootfs serves more than one
+    // container.
+    let name = options.config.as_deref().unwrap_or("config.json");
+    crate::file::read(&bundle.join(name), &mut config)
+        .with_context(|| format!("reading {}/{name}", bundle.display()))?;
 
     let arena = Bump::new();
     let spec = parse::spec(&config, &arena).context("parsing config.json")?;
@@ -463,14 +467,23 @@ fn configure(
     ));
 
     if lowered.creates_userns {
-        namespace::write_id_maps(request.plan, pid)
-            .context("writing the id mappings")?;
+        namespace::write_id_maps(
+            request.plan,
+            pid,
+            request.plan.container()?.deny_setgroups,
+        )
+        .context("writing the id mappings")?;
         sync::send(socket, &Message::new(Kind::IdMapsWritten))?;
     }
 
     settle_cgroup(manager, spec, lowered, socket, pid, in_cgroup)?;
 
-    let record = build_record(request, manager, pid);
+    // Cache and bandwidth partitioning is a filesystem of its own rather
+    // than part of the cgroup, so it is applied here beside the limits and
+    // remembered so that `delete` can undo exactly what this made.
+    let rdt = apply_rdt(spec, &request.options.id, pid)?;
+
+    let record = build_record(request, manager, pid, &rdt);
     // The process is this one's child and is waiting on the socket, so its
     // state is known without a look at `/proc`: what remains open is only
     // whether the payload runs at once or waits for `start`.
@@ -506,13 +519,14 @@ fn configure(
         Kind::Prepared,
         "waiting for the container to be prepared",
     )?;
+
     sync::send(socket, &Message::new(Kind::Proceed))?;
 
     // A profile with a notify action suspends every matching syscall until an
     // agent answers, so the descriptor has to reach the agent before the
     // payload runs. Init sends it back once the filter is installed, which is
     // the last thing it does before executing.
-    deliver_seccomp_listener(spec, &record, socket)?;
+    deliver_seccomp_listener(request.plan, &record, socket)?;
 
     // Applying the process settings is the last thing init does that the
     // configuration can make fail, and it happens after the handshake above.
@@ -664,7 +678,12 @@ fn release_cgroupns(
 }
 
 /// Assembles what the runtime remembers about a container between commands.
-fn build_record(request: &Request<'_>, manager: &Manager, pid: i32) -> Record {
+fn build_record(
+    request: &Request<'_>,
+    manager: &Manager,
+    pid: i32,
+    rdt: &crate::rdt::Created,
+) -> Record {
     let spec = request.spec;
     let hooks = spec.hooks.as_ref();
     Record {
@@ -685,6 +704,13 @@ fn build_record(request: &Request<'_>, manager: &Manager, pid: i32) -> Record {
         cgroup_manager: manager_name(request.global.cgroup_manager).to_owned(),
         owner: crate::owner(),
         awaiting_start: request.awaiting_start,
+        rdt_class: render_path(&rdt.class),
+        rdt_owned: rdt.owned,
+        rdt_monitor: rdt
+            .monitor
+            .as_deref()
+            .map(render_path)
+            .unwrap_or_default(),
         annotations: spec
             .annotations
             .iter()
@@ -695,18 +721,19 @@ fn build_record(request: &Request<'_>, manager: &Manager, pid: i32) -> Record {
 
 /// Passes the seccomp notify descriptor on, when the profile asked for one.
 fn deliver_seccomp_listener(
-    spec: &Spec<'_>,
+    plan: &View<'_>,
     record: &Record,
     socket: BorrowedFd<'_>,
 ) -> Result<()> {
-    let seccomp = spec.linux.as_ref().and_then(|linux| linux.seccomp.as_ref());
-    let Some(path) = seccomp
-        .and_then(|s| s.listener_path)
-        .filter(|p| !p.is_empty())
-    else {
+    // Read from the plan rather than from the configuration a second time.
+    // The plan is what init acted on, and taking half the answer from one
+    // and half from the other is how the two drift apart.
+    let process = plan.process()?;
+    let path = plan.text(process.seccomp_listener)?;
+    if path.is_empty() {
         return Ok(());
-    };
-    let metadata = seccomp.and_then(|s| s.listener_metadata).unwrap_or("");
+    }
+    let metadata = plan.text(process.seccomp_metadata)?;
 
     let (message, listener) = sync::receive_fd(socket)
         .map_err(|e| anyhow::anyhow!("{e}"))
@@ -776,4 +803,43 @@ const fn manager_name(kind: cgroup::Kind) -> &'static str {
         cgroup::Kind::Systemd => "systemd",
         cgroup::Kind::Disabled => "disabled",
     }
+}
+
+/// Confines a process to the CPUs a list names.
+///
+/// The specification states two of these for an exec process: one for
+/// before it is placed in the container's cgroup and one for after, since
+/// the placement itself can change what it may run on. Both are set on the
+/// same process, at the two moments that separate them, and the second is
+/// inherited by the program it goes on to execute.
+pub(crate) fn apply_affinity(list: Option<&str>, pid: i32) -> Result<()> {
+    let Some(list) = list.filter(|list| !list.is_empty()) else {
+        return Ok(());
+    };
+    let set = crate::sys::process::CpuSet::parse(list)?;
+    crate::sys::process::set_affinity(pid, &set)?;
+    Ok(())
+}
+
+/// Puts the container in the cache and bandwidth class it asked for.
+///
+/// Reports the class the container is in, whether this runtime made it, and
+/// any monitoring group it made, so that a later `update` can change the
+/// allocation and `delete` can remove exactly what was created.
+fn apply_rdt(
+    spec: &Spec<'_>,
+    id: &str,
+    pid: i32,
+) -> Result<crate::rdt::Created> {
+    let Some(rdt) = spec.linux.as_ref().and_then(|l| l.intel_rdt.as_ref())
+    else {
+        return Ok(crate::rdt::Created::default());
+    };
+    crate::rdt::apply(rdt, id, pid)
+        .context("applying the cache and bandwidth allocation")
+}
+
+/// A path as the state record keeps it.
+fn render_path(path: &Path) -> String {
+    path.display().to_string()
 }

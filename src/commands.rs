@@ -6,7 +6,7 @@
 
 use std::{io::Write, os::fd::AsFd as _};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use bumpalo::Bump;
 
 use crate::{
@@ -35,6 +35,9 @@ pub fn dispatch(
         Command::Pause { id } => freeze(store, id, true),
         Command::Resume { id } => freeze(store, id, false),
         Command::Update(options) => crate::update::run(store, options),
+        Command::Events { id, interval, once } => {
+            events(store, id, *interval, *once)
+        }
         Command::Spec { bundle, rootless } => spec(bundle, *rootless),
         Command::Features => features(),
         Command::Version => version(),
@@ -77,7 +80,15 @@ fn run(global: &Global, store: &Store, options: &Start) -> Result<i32> {
         None => crate::wait_for_process(created.pid)?,
     };
     let _ = created.manager.destroy();
-    store.remove(&created.record.id)?;
+    // `--keep` leaves the state behind so the caller can still ask what the
+    // container did after it has finished. Without it the record goes with
+    // the container, which is what a caller running one in the foreground
+    // almost always wants.
+    if options.keep {
+        store.save(&created.record, state::Status::Stopped)?;
+    } else {
+        store.remove(&created.record.id)?;
+    }
     run_bundle_hooks(&created.record, HookPoint::PostStop);
     Ok(status)
 }
@@ -180,9 +191,27 @@ fn kill(store: &Store, id: &str, signal: &str, all: bool) -> Result<i32> {
 /// is being read: a process that has gone simply is not signalled.
 fn kill_all(record: &Record, signal: u32) -> Result<i32> {
     let pids = container_processes(record)?;
+    let mut unreached = 0;
     for pid in pids {
-        let _ = send_signal(pid, signal);
+        match signal_one(pid, signal) {
+            Ok(()) => {}
+            // A process that exited between the list being read and the
+            // signal being sent is one fewer process to signal, not a
+            // failure.
+            Err(error) if error == rustix::io::Errno::SRCH => {}
+            Err(error) => {
+                crate::log::warn(&format!("signalling {pid}: {error}"));
+                unreached += 1;
+            }
+        }
     }
+    // Reporting success here would tell a caller that every process in the
+    // container has the signal when some of them do not, and an orchestrator
+    // waiting for the container to stop would wait on that answer.
+    ensure!(
+        unreached == 0,
+        "{unreached} of the container's processes could not be signalled"
+    );
     Ok(0)
 }
 
@@ -197,18 +226,30 @@ fn container_processes(record: &Record) -> Result<Vec<i32>> {
 }
 
 fn send_signal(pid: i32, signal: u32) -> Result<()> {
+    signal_one(pid, signal).context("sending the signal")?;
+    Ok(())
+}
+
+/// Sends one signal, keeping the kernel's own answer.
+///
+/// The errno is what tells a process that has already exited apart from one
+/// this runtime may not signal, and a caller signalling every process in a
+/// container has to treat those differently.
+fn signal_one(
+    pid: i32,
+    signal: u32,
+) -> core::result::Result<(), rustix::io::Errno> {
     use rustix::process::{Pid, Signal, kill_process};
     let Some(pid) = Pid::from_raw(pid) else {
-        bail!("the container has no process to signal");
+        return Err(rustix::io::Errno::SRCH);
     };
     let number = i32::try_from(signal).unwrap_or(0);
     // Every signal number the runtime can produce came from a name table, so
     // it is one the kernel defines.
     let Some(signal) = Signal::from_named_raw(number) else {
-        bail!("unknown signal number: {number}");
+        return Err(rustix::io::Errno::INVAL);
     };
-    kill_process(pid, signal).context("sending the signal")?;
-    Ok(())
+    kill_process(pid, signal)
 }
 
 /// Removes a container.
@@ -224,7 +265,12 @@ fn delete(store: &Store, id: &str, force: bool) -> Result<i32> {
     let status = state::observe(&record);
     let mut manager = crate::cgroup_for(&record)?;
     if status != Status::Stopped {
-        if !force {
+        // A container that was created and never started has no payload to
+        // interrupt, so removing it loses nothing and refusing would leave
+        // a failed start in the way of the next attempt on the same id. One
+        // that is actually running still needs the flag.
+        let started = matches!(status, Status::Running | Status::Paused);
+        if started && !force {
             bail!("container {id} is not stopped; use --force to remove it");
         }
         // A frozen process never acts on a signal, so killing a paused
@@ -237,12 +283,34 @@ fn delete(store: &Store, id: &str, force: bool) -> Result<i32> {
                 ));
             }
         }
+        // Killing the first process is enough when the container has a pid
+        // namespace of its own: the kernel takes the rest of it along.
+        // Without one, what the container started is an ordinary host
+        // process that only the cgroup knows about, and removing the record
+        // would strand it. Doing both covers either kind.
         let _ = send_signal(record.pid, crate::sys::signal::SIGKILL);
+        let mut pids = Vec::new();
+        if manager.processes(&mut pids).is_ok() {
+            for pid in pids.iter().filter(|pid| **pid != record.pid) {
+                let _ = send_signal(*pid, crate::sys::signal::SIGKILL);
+            }
+        }
         wait_until_stopped(&record);
     }
 
     if let Err(error) = manager.destroy() {
         crate::log::warn(&format!("removing the cgroup for {id}: {error}"));
+    }
+    // Only what this runtime made is removed. A class the configuration
+    // named and somebody else created may hold other containers, and taking
+    // it away would take their allocation with it. The monitoring group
+    // goes first: it lives inside the class, and a class with a group still
+    // in it cannot be removed.
+    if !record.rdt_monitor.is_empty() {
+        crate::rdt::remove(std::path::Path::new(&record.rdt_monitor));
+    }
+    if record.rdt_owned && !record.rdt_class.is_empty() {
+        crate::rdt::remove(std::path::Path::new(&record.rdt_class));
     }
     store.remove(id)?;
     run_bundle_hooks(&record, HookPoint::PostStop);
@@ -276,17 +344,32 @@ fn list(store: &Store, json: bool, quiet: bool) -> Result<i32> {
         let mut writer = crate::json::Writer::new();
         writer.array(None);
         for record in &records {
+            let status = crate::observed_status(record);
             writer.object(None);
             writer.string(Some("ociVersion"), &record.oci_version);
             writer.string(Some("id"), &record.id);
-            writer.number(Some("pid"), i64::from(record.pid));
-            writer.string(
-                Some("status"),
-                crate::observed_status(record).as_str(),
-            );
+            // As in the state document: the id of a container that has
+            // stopped belongs to whatever the host gives it to next.
+            let pid = if status == Status::Stopped {
+                0
+            } else {
+                record.pid
+            };
+            writer.number(Some("pid"), i64::from(pid));
+            writer.string(Some("status"), status.as_str());
             writer.string(Some("bundle"), &record.bundle);
             writer.string(Some("created"), &record.created);
             writer.string(Some("owner"), &record.owner);
+            // Callers key their own bookkeeping off the annotations, and
+            // fetching the state of every container one at a time to find
+            // them is what this command exists to avoid.
+            if !record.annotations.is_empty() {
+                writer.object(Some("annotations"));
+                for (key, value) in &record.annotations {
+                    writer.string(Some(key), value);
+                }
+                writer.end_object();
+            }
             writer.end_object();
         }
         writer.end_array();
@@ -344,39 +427,28 @@ fn ps(store: &Store, id: &str, json: bool, args: &[String]) -> Result<i32> {
         command.args(args);
     }
     let output = command.output();
-    match output {
+    let listing = match &output {
         Ok(output) if output.status.success() => {
-            write_filtered(&mut out, &output.stdout, &pids)?;
+            String::from_utf8_lossy(&output.stdout)
         }
-        _ => {
+        _ => std::borrow::Cow::Borrowed(""),
+    };
+    match crate::report::processes_in(&listing, &pids) {
+        Some((header, lines)) => {
+            writeln!(out, "{header}").context("writing the process list")?;
+            for line in lines {
+                writeln!(out, "{line}").context("writing the process list")?;
+            }
+        }
+        // Either `ps` could not be run or its output has no column of
+        // process ids, and the ids themselves are the honest answer.
+        None => {
             for pid in &pids {
                 writeln!(out, "{pid}").context("writing the process list")?;
             }
         }
     }
     Ok(0)
-}
-
-/// Prints the `ps` header plus the lines whose pid is in the container.
-fn write_filtered(
-    out: &mut impl Write,
-    text: &[u8],
-    pids: &[i32],
-) -> Result<()> {
-    let text = String::from_utf8_lossy(text);
-    let mut lines = text.lines();
-    if let Some(header) = lines.next() {
-        writeln!(out, "{header}").context("writing the process list")?;
-    }
-    for line in lines {
-        let matches = line
-            .split_whitespace()
-            .any(|field| field.parse::<i32>().is_ok_and(|p| pids.contains(&p)));
-        if matches {
-            writeln!(out, "{line}").context("writing the process list")?;
-        }
-    }
-    Ok(())
 }
 
 /// Stops or resumes every process in a container.
@@ -504,4 +576,52 @@ fn run_bundle_hooks(record: &Record, point: HookPoint) {
     };
     let state = state::render_public(record, crate::observed_status(record));
     hooks::run_best_effort(list, &state);
+}
+
+/// Reports what a container is using.
+///
+/// One sample and stop when the caller asked for that, otherwise a sample
+/// every interval until the container stops. Each line is one JSON document,
+/// as a supervisor reading a stream expects: it can act on each
+/// as it arrives rather than waiting for a document that only ends when the
+/// container does.
+///
+/// An out-of-memory kill is reported as its own event, between samples,
+/// because a supervisor watching for one cannot wait for the next sample to
+/// notice the container has been killed.
+fn events(store: &Store, id: &str, interval: u64, once: bool) -> Result<i32> {
+    let record = store.load(id)?;
+    let mut manager = crate::cgroup_for(&record)?;
+    let legacy = crate::cgroup::Layout::detect()
+        .is_ok_and(crate::cgroup::Layout::has_legacy);
+
+    let mut out = std::io::stdout().lock();
+    let sample = crate::stats::collect(&mut manager, legacy)?;
+    writeln!(out, "{}", crate::stats::render("stats", id, Some(&sample)))
+        .context("writing the sample")?;
+    if once {
+        return Ok(0);
+    }
+
+    let mut kills = sample.oom_kills;
+    let pause = std::time::Duration::from_secs(interval);
+    // Bounded by the container's life: every turn either reports one and
+    // sleeps, or finds the container stopped and returns. The count is a
+    // ceiling on a container nothing ever stops, which at the shortest
+    // interval this accepts is still years.
+    for _ in 0..u32::MAX {
+        std::thread::sleep(pause);
+        if state::observe(&record) == Status::Stopped {
+            return Ok(0);
+        }
+        let sample = crate::stats::collect(&mut manager, legacy)?;
+        if sample.oom_kills > kills {
+            kills = sample.oom_kills;
+            writeln!(out, "{}", crate::stats::render("oom", id, None))
+                .context("writing the event")?;
+        }
+        writeln!(out, "{}", crate::stats::render("stats", id, Some(&sample)))
+            .context("writing the sample")?;
+    }
+    Ok(0)
 }

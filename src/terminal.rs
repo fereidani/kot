@@ -8,8 +8,12 @@
 //! so that keystrokes reach the container unprocessed, and copies in both
 //! directions until the container exits.
 //!
-//! The copying uses `splice`, so bytes move between descriptors inside the
-//! kernel rather than through a buffer here.
+//! The copying is an ordinary read and write through a small buffer. A
+//! terminal carries what a person types and what the container prints, so
+//! the traffic is tiny and the call count is what matters rather than the
+//! copy; moving the bytes inside the kernel instead would save nothing here
+//! and would still need the buffer for the end-of-file and resize handling
+//! around it.
 
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
@@ -130,6 +134,7 @@ pub fn relay(terminal: BorrowedFd<'_>) -> Result<()> {
 
     let stdin = rustix::stdio::stdin();
     let stdout = rustix::stdio::stdout();
+    inherit_size(terminal, stdin);
     let mut buffer = [0u8; 8192];
     let mut input_open =
         rustix::termios::isatty(stdin) || rustix::fs::fstat(stdin).is_ok();
@@ -201,4 +206,34 @@ fn is_retryable(error: rustix::io::Errno) -> bool {
         error.raw_os_error(),
         crate::sys::error::EINTR | crate::sys::error::EAGAIN
     )
+}
+
+/// Gives the container's terminal the size of the one the caller is at.
+///
+/// A configuration may state `consoleSize`, and where it does that is the
+/// answer. Where it does not, a new pseudo-terminal has no size at all, and
+/// a program that asks how wide its terminal is gets zero: full-screen
+/// programs draw into a window they think has no rows, and anything wrapping
+/// its output wraps at the wrong place. The caller's own terminal is the
+/// only size worth guessing, and it is the size the caller is looking at.
+///
+/// Best effort: a caller whose input is a pipe has no size to lend, and a
+/// container without one is no worse off than before.
+fn inherit_size(terminal: BorrowedFd<'_>, stdin: BorrowedFd<'_>) {
+    use rustix::termios::{tcgetwinsize, tcsetwinsize};
+
+    let Ok(size) = tcgetwinsize(stdin) else {
+        return;
+    };
+    if size.ws_row == 0 && size.ws_col == 0 {
+        return;
+    }
+    // Only where nothing has set one: a size the configuration asked for is
+    // already in place and is not this function's to overwrite.
+    if let Ok(current) = tcgetwinsize(terminal) {
+        if current.ws_row != 0 || current.ws_col != 0 {
+            return;
+        }
+    }
+    let _ = tcsetwinsize(terminal, size);
 }

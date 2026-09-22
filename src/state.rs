@@ -114,6 +114,22 @@ pub struct Record {
     pub hooks: LaterHooks,
     /// Annotations from the configuration, passed through to callers.
     pub annotations: Vec<(String, String)>,
+    /// The cache and bandwidth class this runtime created for the
+    /// container, empty when it made none.
+    ///
+    /// Remembered rather than worked out again, because `delete` must
+    /// remove only a class this runtime made: one the configuration named
+    /// and somebody else created may hold other containers.
+    pub rdt_class: String,
+    /// True when this runtime made that class and may remove it again.
+    pub rdt_owned: bool,
+    /// The monitoring group this runtime created for the container, empty
+    /// when it made none.
+    ///
+    /// Kept apart from the class because a container may be monitored
+    /// inside a class somebody else owns: the group is this runtime's to
+    /// remove even where the class is not.
+    pub rdt_monitor: String,
 }
 
 /// Which of the hook lists that run after creation a configuration has.
@@ -647,6 +663,9 @@ fn parse_private(parser: &mut Parser<'_>, record: &mut Record) -> Result<()> {
             "created" => take_string(parser, &mut record.created)?,
             "cgroupPath" => take_string(parser, &mut record.cgroup_path)?,
             "systemdUnit" => take_string(parser, &mut record.systemd_unit)?,
+            "rdtClass" => take_string(parser, &mut record.rdt_class)?,
+            "rdtOwned" => record.rdt_owned = parser.bool()?,
+            "rdtMonitor" => take_string(parser, &mut record.rdt_monitor)?,
             "cgroupManager" => {
                 take_string(parser, &mut record.cgroup_manager)?;
             }
@@ -693,7 +712,15 @@ fn write_public(
     json.string(Some("ociVersion"), &record.oci_version);
     json.string(Some("id"), &record.id);
     json.string(Some("status"), status.as_str());
-    json.number(Some("pid"), i64::from(record.pid));
+    // A stopped container has no process, and the id it used to have is one
+    // the host is free to hand to something else. Reporting it would let a
+    // caller signal or attribute an unrelated process to this container.
+    let pid = if status == Status::Stopped {
+        0
+    } else {
+        record.pid
+    };
+    json.number(Some("pid"), i64::from(pid));
     json.string(Some("bundle"), &record.bundle);
     if empty_annotations || !record.annotations.is_empty() {
         json.object(Some("annotations"));
