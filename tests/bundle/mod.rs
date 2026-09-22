@@ -40,7 +40,9 @@ impl Bundle {
     ) -> Self {
         let tag = format!("{name}-{}", std::process::id());
         let root = std::env::temp_dir().join(format!("kot-test-{tag}"));
-        let _ = std::fs::remove_dir_all(&root);
+        // A leftover from an earlier run is cleared the same guarded way:
+        // whatever left it behind may have left a mount behind with it.
+        remove_unless_mounted(&root);
         std::fs::create_dir_all(root.join("rootfs")).expect("bundle directory");
 
         let mut config = template(args, &root.join("rootfs"));
@@ -101,8 +103,41 @@ impl Bundle {
 impl Drop for Bundle {
     fn drop(&mut self) {
         self.cleanup();
-        let _ = std::fs::remove_dir_all(&self.root);
+        remove_unless_mounted(&self.root);
     }
+}
+
+/// Removes a bundle, unless something is still mounted inside it.
+///
+/// The rootfs is where the host's `/usr`, `/etc` and the rest are bound, so
+/// a recursive delete of the bundle walks into those mount points. While the
+/// container holds them in its own mount namespace they are empty
+/// directories here and there is nothing to walk into. If one ever leaks
+/// into this namespace, the delete would be walking the host's own
+/// filesystem, and the read-only attribute on those binds is the only thing
+/// that would stop it.
+///
+/// That is too thin a margin for a delete running as root, so the mount
+/// table is checked first. A bundle left behind in the temporary directory
+/// costs nothing; the other outcome costs the machine.
+fn remove_unless_mounted(root: &Path) {
+    let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return;
+    };
+    let prefix = root.display().to_string();
+    for line in table.lines() {
+        let Some(point) = line.split_ascii_whitespace().nth(4) else {
+            continue;
+        };
+        if point == prefix || point.starts_with(&format!("{prefix}/")) {
+            eprintln!(
+                "leaving {prefix} in place: {point} is still mounted, and \
+                 deleting through it would reach the host"
+            );
+            return;
+        }
+    }
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// True when the output reports success.
